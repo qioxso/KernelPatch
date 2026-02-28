@@ -8,21 +8,20 @@
 #include <asm/current.h>
 
 KPM_NAME("kpm-stealth-monitor");
-KPM_VERSION("4.0.0");
+KPM_VERSION("5.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Custom");
-KPM_DESCRIPTION("Auto-Lock APK Syscall Monitor");
+KPM_DESCRIPTION("Multi-Syscall Auto-Lock Monitor");
 
-// 全局变量
-char g_target_pkg[64];    // 存放你要监控的包名
-pid_t g_target_pid = -1;  // 当前锁定的 PID
-int g_is_monitoring = 0;  // 监控开关
+char g_target_pkg[64];    
+pid_t g_target_pid = -1;  
+int g_is_monitoring = 0;  
 
 enum pid_type { PIDTYPE_PID, PIDTYPE_TGID, PIDTYPE_PGID, PIDTYPE_SID, PIDTYPE_MAX };
 struct pid_namespace;
 pid_t (*__task_pid_nr_ns_ptr)(struct task_struct *task, enum pid_type type, struct pid_namespace *ns) = 0;
 
-// 手写极简 strstr，避免找不到外部符号
+// 手写极简 strstr
 char *my_strstr(const char *haystack, const char *needle) {
     if (!haystack || !needle) return 0;
     while (*haystack) {
@@ -48,8 +47,8 @@ void my_strcpy(char *dest, const char *src, int max_len) {
     dest[i] = '\0';
 }
 
-void before_openat_monitor(hook_fargs4_t *args, void *udata)
-{
+// 🔥 核心重构：通用的路径提取与自瞄逻辑
+void handle_path_syscall(const char __user *filename, const char *sys_name) {
     if (g_is_monitoring == 0) return;
 
     struct task_struct *task = current;
@@ -58,10 +57,6 @@ void before_openat_monitor(hook_fargs4_t *args, void *udata)
     if (__task_pid_nr_ns_ptr) {
         current_pid = __task_pid_nr_ns_ptr(task, PIDTYPE_PID, 0);
     }
-
-    int dfd = (int)syscall_argn(args, 0);
-    const char __user *filename = (typeof(filename))syscall_argn(args, 1);
-    int flag = (int)syscall_argn(args, 2);
 
     char buf[512];
     buf[0] = '\0';
@@ -73,24 +68,47 @@ void before_openat_monitor(hook_fargs4_t *args, void *udata)
         buf[0] = '\0';
     }
 
-    // 🔥 核心黑科技：智能锁定 PID
-    if (g_target_pid == -1 && copied > 0) {
-        // 如果还没锁定目标，且当前被打开的文件路径中包含了我们要监控的包名
+    // 智能锁定逻辑 (只要任何系统调用摸到了包含包名的路径，立刻锁定 PID)
+    if (g_target_pid == -1 && copied > 0 && g_target_pkg[0] != '\0') {
         if (my_strstr(buf, g_target_pkg)) {
             g_target_pid = current_pid;
-            pr_info("[KPM-Stealth] 🎯 AUTO-LOCKED! Package [%s] launched at PID: %d\n", g_target_pkg, current_pid);
+            pr_info("[KPM-Stealth] 🎯 AUTO-LOCKED! Package [%s] locked at PID: %d\n", g_target_pkg, current_pid);
         }
     }
 
-    // 🎯 核心过滤：只拦截锁定的 PID
+    // 过滤掉非目标 PID 的干扰信息
     if (current_pid != g_target_pid) {
         return;
     }
 
+    // 打印命中的系统调用与路径
     if (copied > 0) {
-        pr_info("[KPM-Stealth] PID: %d openat -> %s (flag: %x)\n", current_pid, buf, flag);
+        pr_info("[KPM-Stealth] PID: %d [%s] -> %s\n", current_pid, sys_name, buf);
     }
 }
+
+// ---------------- 分发回调区 ----------------
+
+// 1. 拦截 openat (参数1是路径)
+void before_openat_monitor(hook_fargs4_t *args, void *udata) {
+    const char __user *filename = (typeof(filename))syscall_argn(args, 1);
+    handle_path_syscall(filename, "openat");
+}
+
+// 2. 拦截 faccessat (参数1是路径)
+void before_faccessat_monitor(hook_fargs4_t *args, void *udata) {
+    const char __user *filename = (typeof(filename))syscall_argn(args, 1);
+    handle_path_syscall(filename, "faccessat");
+}
+
+// 3. 拦截 execve (参数0是路径)
+void before_execve_monitor(hook_fargs4_t *args, void *udata) {
+    const char __user *filename = (typeof(filename))syscall_argn(args, 0);
+    handle_path_syscall(filename, "execve");
+}
+
+
+// ---------------- 模块生命周期 ----------------
 
 static long monitor_init(const char *args, const char *event, void *__user reserved)
 {
@@ -100,24 +118,22 @@ static long monitor_init(const char *args, const char *event, void *__user reser
 
     __task_pid_nr_ns_ptr = (typeof(__task_pid_nr_ns_ptr))kallsyms_lookup_name("__task_pid_nr_ns");
 
-    hook_err_t err = fp_hook_syscalln(__NR_openat, 4, before_openat_monitor, 0, 0);
-    if (err) {
-        pr_err("[KPM-Stealth] Hook failed: %d\n", err);
-    } else {
-        pr_info("[KPM-Stealth] Loaded. Waiting for package name via control0...\n");
-    }
-
+    // 批量挂载 Hook
+    fp_hook_syscalln(__NR_openat, 4, before_openat_monitor, 0, 0);
+    fp_hook_syscalln(__NR_faccessat, 4, before_faccessat_monitor, 0, 0);
+    fp_hook_syscalln(__NR_execve, 3, before_execve_monitor, 0, 0);
+    
+    pr_info("[KPM-Stealth] V5 Loaded. Hooked openat, faccessat, execve.\n");
     return 0;
 }
 
 static long monitor_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (args && args[0] != '\0') {
-        // 收到包名后，重置 PID，进入“埋伏”状态
         my_strcpy(g_target_pkg, args, sizeof(g_target_pkg));
         g_target_pid = -1; 
         g_is_monitoring = 1;
-        pr_info("[KPM-Stealth] Sniper mode ON. Waiting for [%s] to launch...\n", g_target_pkg);
+        pr_info("[KPM-Stealth] Sniper mode ON. Waiting for [%s]...\n", g_target_pkg);
     } else {
         g_is_monitoring = 0;
         g_target_pid = -1;
@@ -128,7 +144,11 @@ static long monitor_control0(const char *args, char *__user out_msg, int outlen)
 
 static long monitor_exit(void *__user reserved)
 {
+    // 批量卸载 Hook，必须与挂载的顺序和内容严格对应
     fp_unhook_syscalln(__NR_openat, before_openat_monitor, 0);
+    fp_unhook_syscalln(__NR_faccessat, before_faccessat_monitor, 0);
+    fp_unhook_syscalln(__NR_execve, before_execve_monitor, 0);
+    
     pr_info("[KPM-Stealth] Exited safely.\n");
     return 0;
 }
