@@ -8,10 +8,10 @@
 #include <asm/current.h>
 
 KPM_NAME("kpm-stealth-monitor");
-KPM_VERSION("7.0.0");
+KPM_VERSION("7.1.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Custom");
-KPM_DESCRIPTION("God Mode APK Analyzer (Net, Mem, File, Anti-Debug)");
+KPM_DESCRIPTION("God Mode APK Analyzer (Fixed Net Hook)");
 
 char g_target_pkg[64];    
 pid_t g_target_pid = -1;  
@@ -21,7 +21,9 @@ enum pid_type { PIDTYPE_PID, PIDTYPE_TGID, PIDTYPE_PGID, PIDTYPE_SID, PIDTYPE_MA
 struct pid_namespace;
 pid_t (*__task_pid_nr_ns_ptr)(struct task_struct *task, enum pid_type type, struct pid_namespace *ns) = 0;
 
-// 自定义网络结构体，避免引入 <linux/in.h> 导致内核头文件冲突
+// 动态获取内存拷贝函数的指针
+unsigned long (*__my_copy_from_user)(void *to, const void __user *from, unsigned long n) = 0;
+
 struct custom_sockaddr_in {
     unsigned short sin_family;
     unsigned short sin_port;
@@ -76,107 +78,101 @@ void extract_and_log_path(const char __user *filename, const char *sys_name) {
     }
 
     if (current_pid != g_target_pid) return;
-
     if (copied > 0) pr_info("[KPM-GodMode] PID: %d [%s] -> %s\n", current_pid, sys_name, buf);
 }
 
-// ================== 核心拦截区 (执行前) ==================
+// ================== 核心拦截区 ==================
 
-// 1. 文件系统操作
 void before_openat(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 1), "openat"); }
 void before_faccessat(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 1), "faccessat"); }
 void before_execve(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 0), "execve"); }
-void before_unlinkat(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 1), "unlinkat(DEL)"); }
+void before_unlinkat(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 1), "unlinkat"); }
 
-// 2. 🛡️ 网络通信 (直击底层套接字)
+// 🌐 修复后的网络拦截逻辑
 void before_connect(hook_fargs4_t *args, void *udata) {
     if (!is_target_pid()) return;
     
-    // 参数1是 fd, 参数2是 sockaddr 结构体指针
+    int fd = (int)syscall_argn(args, 0);
     const void __user *uservaddr = (const void __user *)syscall_argn(args, 1);
     struct custom_sockaddr_in addr;
     
-    // 安全地从用户空间拷贝结构体到内核
-    if (copy_from_user(&addr, uservaddr, sizeof(struct custom_sockaddr_in)) == 0) {
-        // AF_INET (2) 代表 IPv4 连接
-        if (addr.sin_family == 2) { 
-            // 字节序转换 (网络大端序转主机小端序)
-            unsigned short port = ((addr.sin_port & 0xFF) << 8) | ((addr.sin_port & 0xFF00) >> 8);
-            unsigned int ip = addr.sin_addr;
-            unsigned char *ip_bytes = (unsigned char *)&ip;
-            
-            pr_info("[KPM-GodMode] 🌐 NETWORK! PID: %d [connect] -> IP: %d.%d.%d.%d, Port: %d\n", 
-                    g_target_pid, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], port);
+    // 如果我们成功找到了内核的拷贝函数，就解析 IP
+    if (__my_copy_from_user) {
+        // 返回 0 表示全部拷贝成功
+        if (__my_copy_from_user(&addr, uservaddr, sizeof(struct custom_sockaddr_in)) == 0) {
+            if (addr.sin_family == 2) { 
+                unsigned short port = ((addr.sin_port & 0xFF) << 8) | ((addr.sin_port & 0xFF00) >> 8);
+                unsigned char *ip_bytes = (unsigned char *)&addr.sin_addr;
+                
+                pr_info("[KPM-GodMode] 🌐 NET! PID: %d [connect] -> IP: %d.%d.%d.%d, Port: %d\n", 
+                        g_target_pid, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], port);
+                return;
+            }
         }
     }
+    
+    // 如果找不到拷贝函数，或者不是 IPv4 协议，则退而求其次打印 FD
+    pr_info("[KPM-GodMode] 🌐 NET! PID: %d [connect] -> fd: %d (Pointer: %px)\n", g_target_pid, fd, uservaddr);
 }
 
-// 3. 🧠 内存执行权限探测 (脱壳/动态加载)
 void before_mprotect(hook_fargs4_t *args, void *udata) {
     if (!is_target_pid()) return;
-    
     unsigned long start = (unsigned long)syscall_argn(args, 0);
     unsigned long len = (unsigned long)syscall_argn(args, 1);
     unsigned long prot = (unsigned long)syscall_argn(args, 2);
-    
-    // PROT_EXEC 的值通常是 4。如果应用赋予一块内存可执行权限，非常可疑！
     if (prot & 4) {
         pr_info("[KPM-GodMode] 🧠 EXECUTABLE MEMORY! PID: %d [mprotect] -> Addr: %lx, Size: %lu, Prot: %lx\n", 
                 g_target_pid, start, len, prot);
     }
 }
 
-// 4. 🛑 进程属性控制 (反调试常见)
 void before_prctl(hook_fargs4_t *args, void *udata) {
     if (!is_target_pid()) return;
     long option = (long)syscall_argn(args, 0);
-    // PR_SET_DUMPABLE 是 4，用来禁止内存导出
     if (option == 4) {
         long arg2 = (long)syscall_argn(args, 1);
         pr_info("[KPM-GodMode] 🛑 ANTI-DUMP! PID: %d [prctl(PR_SET_DUMPABLE)] -> value: %ld\n", g_target_pid, arg2);
     }
 }
 
-
-// ================== 执行后 Hook (主动篡改防御) ==================
-
+// 🛡️ 主动防御
 void active_defense_after_hook(hook_fargs4_t *args, int path_arg_index) {
     if (!is_target_pid()) return;
-
     const char __user *filename = (const char __user *)syscall_argn(args, path_arg_index);
     char buf[256]; buf[0] = '\0';
     long copied = compat_strncpy_from_user(buf, filename, sizeof(buf) - 1);
     if (copied > 0 && copied < sizeof(buf)) buf[copied] = '\0';
 
-    // 强行欺骗 App，告诉它找不到这些敏感文件
     if (my_strstr(buf, "su") || my_strstr(buf, "magisk") || my_strstr(buf, "xposed") || my_strstr(buf, "frida")) {
         pr_info("[KPM-GodMode] 🛡️ BLOCKED DETECT: %s\n", buf);
-        args->ret = -2; // -ENOENT
+        args->ret = -2; // 强行返回不存在
     }
 }
 
 void after_openat(hook_fargs4_t *args, void *udata) { active_defense_after_hook(args, 1); }
 void after_faccessat(hook_fargs4_t *args, void *udata) { active_defense_after_hook(args, 1); }
 
-
-// ================== 生命周期管理 ==================
+// ================== 生命周期 ==================
 
 static long monitor_init(const char *args, const char *event, void *__user reserved) {
     g_target_pkg[0] = '\0'; g_target_pid = -1; g_is_monitoring = 0;
     __task_pid_nr_ns_ptr = (typeof(__task_pid_nr_ns_ptr))kallsyms_lookup_name("__task_pid_nr_ns");
 
-    // 疯狂挂载 Hook 钩子
+    // 🔥 核心改动：动态挖掘底层真实的内存拷贝函数
+    __my_copy_from_user = (void *)kallsyms_lookup_name("_copy_from_user");
+    if (!__my_copy_from_user) {
+        __my_copy_from_user = (void *)kallsyms_lookup_name("__arch_copy_from_user");
+    }
+
     fp_hook_syscalln(__NR_execve, 3, before_execve, 0, 0);
     fp_hook_syscalln(__NR_unlinkat, 3, before_unlinkat, 0, 0);
     fp_hook_syscalln(__NR_connect, 3, before_connect, 0, 0);
     fp_hook_syscalln(__NR_mprotect, 3, before_mprotect, 0, 0);
     fp_hook_syscalln(__NR_prctl, 5, before_prctl, 0, 0);
-
-    // 带执行后篡改的 Hook
     fp_hook_syscalln(__NR_openat, 4, before_openat, after_openat, 0);
     fp_hook_syscalln(__NR_faccessat, 4, before_faccessat, after_faccessat, 0);
     
-    pr_info("[KPM-GodMode] V7 Loaded. Watching File, Net, Mem, & Anti-Debug!\n");
+    pr_info("[KPM-GodMode] V7.1 Loaded.\n");
     return 0;
 }
 
