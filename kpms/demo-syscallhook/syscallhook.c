@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* 
- * Copyright (C) 2023 bmax121. All Rights Reserved.
+/* * Customized KPM Module for APK Syscall Monitoring
+ * Based on original syscallhook.c
  */
 
 #include <compiler.h>
@@ -12,18 +12,19 @@
 #include <linux/string.h>
 #include <kputils.h>
 #include <asm/current.h>
+#include <linux/sched.h> // 引入 task_struct 和 current
 
-KPM_NAME("kpm-syscall-hook-demo");
+KPM_NAME("kpm-apk-monitor");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("bmax121");
-KPM_DESCRIPTION("KernelPatch Module System Call Hook Example");
+KPM_AUTHOR("Custom");
+KPM_DESCRIPTION("KernelPatch Module for APK Syscall Monitoring (openat)");
 
-const char *margs = 0;
-enum hook_type hook_type = NONE;
+// 保存目标 APK 的进程名 (通常是包名的前15个字符)
+const char *target_pkg = 0;
 
-enum pid_type
-{
+// PID 命名空间解析函数指针 (用于在 Android 容器中获取准确的 PID)
+enum pid_type {
     PIDTYPE_PID,
     PIDTYPE_TGID,
     PIDTYPE_PGID,
@@ -31,104 +32,95 @@ enum pid_type
     PIDTYPE_MAX,
 };
 struct pid_namespace;
-pid_t (*__task_pid_nr_ns)(struct task_struct *task, enum pid_type type, struct pid_namespace *ns) = 0;
+pid_t (*__task_pid_nr_ns_ptr)(struct task_struct *task, enum pid_type type, struct pid_namespace *ns) = 0;
 
-void before_openat_0(hook_fargs4_t *args, void *udata)
+// openat 执行前的拦截函数
+void before_openat_monitor(hook_fargs4_t *args, void *udata)
 {
+    struct task_struct *task = current;
+
+    // 1. 核心过滤逻辑：如果进程名不匹配，直接放行，极大降低系统性能损耗
+    // 注意：task->comm 最大长度通常为 15 字符，所以用 strncmp 进行安全比对
+    if (!target_pkg || strncmp(task->comm, target_pkg, 15) != 0) {
+        return; 
+    }
+
+    // 2. 提取 openat 的参数
     int dfd = (int)syscall_argn(args, 0);
     const char __user *filename = (typeof(filename))syscall_argn(args, 1);
     int flag = (int)syscall_argn(args, 2);
     umode_t mode = (int)syscall_argn(args, 3);
 
-    char buf[1024];
-    compat_strncpy_from_user(buf, filename, sizeof(buf));
+    // 3. 安全地将用户态的文件路径拷贝到内核态
+    char buf[512] = {0};
+    long copied = compat_strncpy_from_user(buf, filename, sizeof(buf) - 1);
 
-    struct task_struct *task = current;
+    // 4. 获取准确的 PID 和 TGID
     pid_t pid = -1, tgid = -1;
-    if (__task_pid_nr_ns) {
-        pid = __task_pid_nr_ns(task, PIDTYPE_PID, 0);
-        tgid = __task_pid_nr_ns(task, PIDTYPE_TGID, 0);
+    if (__task_pid_nr_ns_ptr) {
+        pid = __task_pid_nr_ns_ptr(task, PIDTYPE_PID, 0);
+        tgid = __task_pid_nr_ns_ptr(task, PIDTYPE_TGID, 0);
+    } else {
+        pid = task->pid;
+        tgid = task->tgid;
     }
 
-    args->local.data0 = (uint64_t)task;
-
-    pr_info("hook_chain_0 task: %llx, pid: %d, tgid: %d, openat dfd: %d, filename: %s, flag: %x, mode: %d\n", task, pid,
-            tgid, dfd, buf, flag, mode);
+    // 5. 打印命中目标的日志信息
+    if (copied > 0) {
+        pr_info("[KPM-APK-Monitor] Hit! App: %s (PID: %d, TGID: %d) openat -> fd: %d, path: %s, flag: %x, mode: %d\n", 
+                task->comm, pid, tgid, dfd, buf, flag, mode);
+    } else {
+        pr_info("[KPM-APK-Monitor] Hit! App: %s (PID: %d) attempted to open invalid pointer.\n", 
+                task->comm, pid);
+    }
 }
 
-uint64_t open_counts = 0;
-
-void before_openat_1(hook_fargs4_t *args, void *udata)
+// 模块初始化
+static long apk_monitor_init(const char *args, const char *event, void *__user reserved)
 {
-    uint64_t *pcount = (uint64_t *)udata;
-    (*pcount)++;
-    pr_info("hook_chain_1 before openat task: %llx, count: %llx\n", args->local.data0, *pcount);
-}
+    target_pkg = args;
+    pr_info("[KPM-APK-Monitor] Init... Target APK/Process: %s\n", target_pkg ? target_pkg : "NONE");
 
-void after_openat_1(hook_fargs4_t *args, void *udata)
-{
-    pr_info("hook_chain_1 after openat task: %llx\n", args->local.data0);
-}
-
-static long syscall_hook_demo_init(const char *args, const char *event, void *__user reserved)
-{
-    margs = args;
-    pr_info("kpm-syscall-hook-demo init ..., args: %s\n", margs);
-
-    __task_pid_nr_ns = (typeof(__task_pid_nr_ns))kallsyms_lookup_name("__task_pid_nr_ns");
-    pr_info("kernel function __task_pid_nr_ns addr: %llx\n", __task_pid_nr_ns);
-
-    if (!margs) {
-        pr_warn("no args specified, skip hook\n");
+    if (!target_pkg || strlen(target_pkg) == 0) {
+        pr_warn("[KPM-APK-Monitor] No target package specified! Module loaded but doing nothing.\n");
         return 0;
     }
+
+    // 查找并保存 __task_pid_nr_ns 的内核函数地址
+    __task_pid_nr_ns_ptr = (typeof(__task_pid_nr_ns_ptr))kallsyms_lookup_name("__task_pid_nr_ns");
 
     hook_err_t err = HOOK_NO_ERR;
 
-    if (!strcmp("function_pointer_hook", margs)) {
-        pr_info("function pointer hook ...");
-        hook_type = FUNCTION_POINTER_CHAIN;
-        err = fp_hook_syscalln(__NR_openat, 4, before_openat_0, 0, 0);
-        if (err) goto out;
-        err = fp_hook_syscalln(__NR_openat, 4, before_openat_1, after_openat_1, &open_counts);
-    } else if (!strcmp("inline_hook", margs)) {
-        pr_info("inline hook ...");
-        hook_type = INLINE_CHAIN;
-        err = inline_hook_syscalln(__NR_openat, 4, before_openat_0, 0, 0);
-    } else {
-        pr_warn("unknown args: %s\n", margs);
-        return 0;
-    }
+    // 挂载函数指针 Hook 拦截 __NR_openat 系统调用
+    err = fp_hook_syscalln(__NR_openat, 4, before_openat_monitor, 0, 0);
 
-out:
     if (err) {
-        pr_err("hook openat error: %d\n", err);
+        pr_err("[KPM-APK-Monitor] Failed to hook openat! Error code: %d\n", err);
     } else {
-        pr_info("hook openat success\n");
+        pr_info("[KPM-APK-Monitor] Successfully hooked openat. Waiting for target process...\n");
     }
+
     return 0;
 }
 
-static long syscall_hook_control0(const char *args, char *__user out_msg, int outlen)
+// 模块控制接口
+static long apk_monitor_control0(const char *args, char *__user out_msg, int outlen)
 {
-    pr_info("syscall_hook control, args: %s\n", args);
+    pr_info("[KPM-APK-Monitor] Control received args: %s\n", args);
     return 0;
 }
 
-static long syscall_hook_demo_exit(void *__user reserved)
+// 模块卸载
+static long apk_monitor_exit(void *__user reserved)
 {
-    pr_info("kpm-syscall-hook-demo exit ...\n");
+    pr_info("[KPM-APK-Monitor] Exiting and unhooking...\n");
 
-    if (hook_type == INLINE_CHAIN) {
-        inline_unhook_syscalln(__NR_openat, before_openat_0, 0);
-    } else if (hook_type == FUNCTION_POINTER_CHAIN) {
-        fp_unhook_syscalln(__NR_openat, before_openat_0, 0);
-        fp_unhook_syscalln(__NR_openat, before_openat_1, after_openat_1);
-    } else {
-    }
+    // 卸载 Hook，恢复内核原始状态
+    fp_unhook_syscalln(__NR_openat, before_openat_monitor, 0);
+    
     return 0;
 }
 
-KPM_INIT(syscall_hook_demo_init);
-KPM_CTL0(syscall_hook_control0);
-KPM_EXIT(syscall_hook_demo_exit);
+KPM_INIT(apk_monitor_init);
+KPM_CTL0(apk_monitor_control0);
+KPM_EXIT(apk_monitor_exit);
