@@ -39,14 +39,16 @@ void (*__get_task_comm_ptr)(char *buf, struct task_struct *tsk) = 0;
 void before_openat_monitor(hook_fargs4_t *args, void *udata)
 {
     struct task_struct *task = current;
-    char comm[16] = {0}; // 用于存放获取到的进程名
+    
+    // 1. 移除 ={0}，避免触发 memset，手动将首字符置空
+    char comm[16];
+    comm[0] = '\0'; 
 
-    // 3. 安全地获取进程名 (代替 task->comm)
     if (__get_task_comm_ptr) {
         __get_task_comm_ptr(comm, task);
+        comm[15] = '\0'; // 确保安全截断
     }
 
-    // 4. 进程过滤：如果不匹配则放行
     if (!target_pkg || strncmp(comm, target_pkg, 15) != 0) {
         return; 
     }
@@ -56,17 +58,24 @@ void before_openat_monitor(hook_fargs4_t *args, void *udata)
     int flag = (int)syscall_argn(args, 2);
     umode_t mode = (int)syscall_argn(args, 3);
 
-    char buf[512] = {0};
+    // 2. 移除 ={0}，避免触发 memset
+    char buf[512];
+    buf[0] = '\0'; 
     long copied = compat_strncpy_from_user(buf, filename, sizeof(buf) - 1);
 
-    // 5. 安全地获取 PID 和 TGID (代替 task->pid 和 task->tgid)
+    // 3. 手动确保字符串末尾有结束符 \0
+    if (copied > 0 && copied < sizeof(buf)) {
+        buf[copied] = '\0'; 
+    } else {
+        buf[0] = '\0'; // 复制失败时清空
+    }
+
     pid_t pid = -1, tgid = -1;
     if (__task_pid_nr_ns_ptr) {
         pid = __task_pid_nr_ns_ptr(task, PIDTYPE_PID, 0);
         tgid = __task_pid_nr_ns_ptr(task, PIDTYPE_TGID, 0);
     }
 
-    // 6. 打印日志
     if (copied > 0) {
         pr_info("[KPM-APK-Monitor] Hit! App: %s (PID: %d) openat fd: %d, path: %s, flag: %x\n", 
                 comm, pid, dfd, buf, flag);
