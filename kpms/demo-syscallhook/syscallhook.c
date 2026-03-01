@@ -8,10 +8,10 @@
 #include <asm/current.h>
 
 KPM_NAME("kpm-stealth-monitor");
-KPM_VERSION("9.0.0");
+KPM_VERSION("13.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Custom");
-KPM_DESCRIPTION("V9 Precise-Lock Analyzer (Pure App TIDs)");
+KPM_DESCRIPTION("V13 Perfect Lock (Write/Create Action Filter)");
 
 char g_target_pkg[64];    
 pid_t g_target_tgid = -1; 
@@ -63,8 +63,25 @@ int is_target_tgid(void) {
     return (get_current_tgid() == g_target_tgid);
 }
 
-// ================== 🔥 核心修复：精准智能锁定 ==================
-void extract_and_log_path(const char __user *filename, const char *sys_name) {
+// ================== 🔥 V13 核心：写动作物理级过滤 ==================
+
+// 尝试锁定：只接受具有“写入/修改/创建”性质的底层动作
+void try_lock(const char *buf, pid_t current_tgid, int is_write_action) {
+    if (g_target_tgid == -1 && g_target_pkg[0] != '\0' && is_write_action) {
+        if (my_strstr(buf, g_target_pkg)) {
+            // 必须是私有数据目录，且必须是“写”动作（彻底屏蔽 system_server 的只读检测）
+            if (my_strstr(buf, "/data/data/") || 
+                my_strstr(buf, "/data/user/0/") || 
+                my_strstr(buf, "/data/user_de/0/")) {
+                
+                g_target_tgid = current_tgid;
+                pr_info("[KPM-V13] 🎯 STRICT LOCK! App [%s] locked at TGID: %d via Write Action\n", g_target_pkg, current_tgid);
+            }
+        }
+    }
+}
+
+void extract_and_log_path(const char __user *filename, const char *sys_name, int is_write_action) {
     if (g_is_monitoring == 0) return;
     pid_t current_tgid = get_current_tgid();
     pid_t current_tid = get_current_tid();
@@ -73,35 +90,36 @@ void extract_and_log_path(const char __user *filename, const char *sys_name) {
     long copied = compat_strncpy_from_user(buf, filename, sizeof(buf) - 1);
     if (copied > 0 && copied < sizeof(buf)) buf[copied] = '\0'; else buf[0] = '\0';
 
-    // 精确锁定逻辑
-    if (g_target_tgid == -1 && copied > 0 && g_target_pkg[0] != '\0') {
-        if (my_strstr(buf, g_target_pkg)) {
-            // 🔥 增加严格过滤：只有访问包含自己包名的“私有数据目录”时，才确认为本体！
-            // 这彻底屏蔽了桌面(Launcher)或系统服务(system_server)因为读取 APK 而导致的误锁
-            if (my_strstr(buf, "/data/data/") || 
-                my_strstr(buf, "/data/user/0/") || 
-                my_strstr(buf, "/data/user_de/0/")) {
-                
-                g_target_tgid = current_tgid;
-                pr_info("[KPM-V9] 🎯 PRECISE LOCK! Real App [%s] locked at TGID: %d\n", g_target_pkg, current_tgid);
-            }
-        }
+    if (copied > 0) {
+        // 尝试锁定目标 (只有写动作才会被考虑)
+        try_lock(buf, current_tgid, is_write_action);
     }
 
+    // 锁定后，打印它的所有动作（读、写、执行全部打印）
     if (current_tgid != g_target_tgid) return;
-    if (copied > 0) pr_info("[KPM-V9] TID: %d [%s] -> %s\n", current_tid, sys_name, buf);
+    if (copied > 0) pr_info("[KPM-V13] TID: %d [%s] -> %s\n", current_tid, sys_name, buf);
 }
 
 // ================== 核心拦截区 ==================
 
-void before_openat(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 1), "openat"); }
-void before_faccessat(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 1), "faccessat"); }
-void before_execve(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 0), "execve"); }
-void before_unlinkat(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 1), "unlinkat"); }
+void before_openat(hook_fargs4_t *args, void *udata) { 
+    int flag = (int)syscall_argn(args, 2);
+    // 判断是否有写权限或创建权限: O_WRONLY(1), O_RDWR(2), O_CREAT(64)
+    int is_write = ((flag & 3) != 0) || ((flag & 64) != 0); 
+    extract_and_log_path((const char __user *)syscall_argn(args, 1), "openat", is_write); 
+}
 
-// 📦 载荷转移监控 (renameat)
+// 探测、执行 均为纯读取，不作为锁定的依据，防止误锁系统进程
+void before_faccessat(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 1), "faccessat", 0); }
+void before_execve(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 0), "execve", 0); }
+
+// 删除一定是写操作
+void before_unlinkat(hook_fargs4_t *args, void *udata) { extract_and_log_path((const char __user *)syscall_argn(args, 1), "unlinkat", 1); }
+
+// 📦 载荷转移监控 (renameat 也是写操作)
 void before_renameat(hook_fargs4_t *args, void *udata) {
-    if (!is_target_tgid()) return;
+    if (g_is_monitoring == 0) return;
+    pid_t current_tgid = get_current_tgid();
     
     char old_buf[256]; old_buf[0] = '\0';
     char new_buf[256]; new_buf[0] = '\0';
@@ -112,7 +130,11 @@ void before_renameat(hook_fargs4_t *args, void *udata) {
     if (c1 > 0 && c1 < sizeof(old_buf)) old_buf[c1] = '\0';
     if (c2 > 0 && c2 < sizeof(new_buf)) new_buf[c2] = '\0';
     
-    pr_info("[KPM-V9] 📦 RENAME! TID: %d [renameat] -> From: %s, To: %s\n", get_current_tid(), old_buf, new_buf);
+    if (c1 > 0) try_lock(old_buf, current_tgid, 1);
+    if (c2 > 0) try_lock(new_buf, current_tgid, 1);
+
+    if (current_tgid != g_target_tgid) return;
+    pr_info("[KPM-V13] 📦 RENAME! TID: %d [renameat] -> From: %s, To: %s\n", get_current_tid(), old_buf, new_buf);
 }
 
 // 🗡️ 信号监控 (kill)
@@ -120,7 +142,7 @@ void before_kill(hook_fargs4_t *args, void *udata) {
     if (!is_target_tgid()) return;
     pid_t target_pid = (pid_t)syscall_argn(args, 0);
     int sig = (int)syscall_argn(args, 1);
-    pr_info("[KPM-V9] 🗡️ KILL SIGNAL! TID: %d [kill] -> Target PID: %d, Signal: %d\n", get_current_tid(), target_pid, sig);
+    pr_info("[KPM-V13] 🗡️ KILL SIGNAL! TID: %d [kill] -> Target PID: %d, Signal: %d\n", get_current_tid(), target_pid, sig);
 }
 
 // 🌐 网络监控
@@ -132,7 +154,7 @@ void before_connect(hook_fargs4_t *args, void *udata) {
         if (addr.sin_family == 2) { 
             unsigned short port = ((addr.sin_port & 0xFF) << 8) | ((addr.sin_port & 0xFF00) >> 8);
             unsigned char *ip = (unsigned char *)&addr.sin_addr;
-            pr_info("[KPM-V9] 🌐 NET! TID: %d [connect] -> IP: %d.%d.%d.%d, Port: %d\n", 
+            pr_info("[KPM-V13] 🌐 NET! TID: %d [connect] -> IP: %d.%d.%d.%d, Port: %d\n", 
                     get_current_tid(), ip[0], ip[1], ip[2], ip[3], port);
         }
     }
@@ -145,7 +167,7 @@ void before_mprotect(hook_fargs4_t *args, void *udata) {
     unsigned long len = (unsigned long)syscall_argn(args, 1);
     unsigned long prot = (unsigned long)syscall_argn(args, 2);
     if (prot & 4) {
-        pr_info("[KPM-V9] 🧠 EXEC MEM! TID: %d [mprotect] -> Addr: %lx, Size: %lu, Prot: %lx\n", 
+        pr_info("[KPM-V13] 🧠 EXEC MEM! TID: %d [mprotect] -> Addr: %lx, Size: %lu, Prot: %lx\n", 
                 get_current_tid(), start, len, prot);
     }
 }
@@ -153,7 +175,7 @@ void before_mprotect(hook_fargs4_t *args, void *udata) {
 void before_prctl(hook_fargs4_t *args, void *udata) {
     if (!is_target_tgid()) return;
     long option = (long)syscall_argn(args, 0);
-    if (option == 4) pr_info("[KPM-V9] 🛑 ANTI-DUMP! TID: %d [prctl(PR_SET_DUMPABLE)]\n", get_current_tid());
+    if (option == 4) pr_info("[KPM-V13] 🛑 ANTI-DUMP! TID: %d [prctl(PR_SET_DUMPABLE)]\n", get_current_tid());
 }
 
 // 🛡️ 主动防御区
@@ -165,7 +187,7 @@ void active_defense_after_hook(hook_fargs4_t *args, int path_arg_index) {
     if (copied > 0 && copied < sizeof(buf)) buf[copied] = '\0';
 
     if (my_strstr(buf, "su") || my_strstr(buf, "magisk") || my_strstr(buf, "xposed") || my_strstr(buf, "frida")) {
-        pr_info("[KPM-V9] 🛡️ BLOCKED DETECT: %s\n", buf);
+        pr_info("[KPM-V13] 🛡️ BLOCKED DETECT: %s\n", buf);
         args->ret = -2; // 强行返回不存在
     }
 }
@@ -192,7 +214,7 @@ static long monitor_init(const char *args, const char *event, void *__user reser
     fp_hook_syscalln(__NR_openat, 4, before_openat, after_openat, 0);
     fp_hook_syscalln(__NR_faccessat, 4, before_faccessat, after_faccessat, 0);
     
-    pr_info("[KPM-V9] Loaded. Precise Target Lock Enabled.\n");
+    pr_info("[KPM-V13] Loaded. Read/Write Action Filter Enabled.\n");
     return 0;
 }
 
@@ -200,10 +222,10 @@ static long monitor_control0(const char *args, char *__user out_msg, int outlen)
     if (args && args[0] != '\0') {
         my_strcpy(g_target_pkg, args, sizeof(g_target_pkg));
         g_target_tgid = -1; g_is_monitoring = 1;
-        pr_info("[KPM-V9] Sniper ON. Waiting for App [%s] to access its private data...\n", g_target_pkg);
+        pr_info("[KPM-V13] Sniper ON. Waiting for App [%s] to WRITE to its private data...\n", g_target_pkg);
     } else {
         g_is_monitoring = 0; g_target_tgid = -1;
-        pr_info("[KPM-V9] Stopped.\n");
+        pr_info("[KPM-V13] Stopped.\n");
     }
     return 0;
 }
@@ -218,7 +240,7 @@ static long monitor_exit(void *__user reserved) {
     fp_unhook_syscalln(__NR_kill, before_kill, 0);
     fp_unhook_syscalln(__NR_openat, before_openat, after_openat);
     fp_unhook_syscalln(__NR_faccessat, before_faccessat, after_faccessat);
-    pr_info("[KPM-V9] Exited.\n");
+    pr_info("[KPM-V13] Exited.\n");
     return 0;
 }
 
