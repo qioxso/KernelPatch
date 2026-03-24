@@ -8,6 +8,12 @@ else
 endif
 endif
 
+NEED_TOOLCHAIN := 1
+ifeq ($(strip $(MAKECMDGOALS)),clean)
+    NEED_TOOLCHAIN := 0
+endif
+
+ifeq ($(NEED_TOOLCHAIN),1)
 ifeq ($(origin TARGET_COMPILE), undefined)
     $(error TARGET_COMPILE not set)
 endif
@@ -25,6 +31,7 @@ endif
 ifeq ($(origin READELF), command line)
 else
     READELF := $(TARGET_COMPILE)readelf
+endif
 endif
 
 CFLAGS += -std=gnu11
