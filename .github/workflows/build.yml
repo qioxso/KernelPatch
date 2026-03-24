@@ -58,11 +58,11 @@ jobs:
 
           cd ../demo-syscallhook
           make
-          mv amem_kpm.kpm amem_kpm.kpm
+          mv syscallhook.kpm demo-syscallhook.kpm
 
           cd ../new
           make
-          mv syscallhook.kpm demo-syscallhook.kpm
+          mv amem_kpm.kpm amem_kpm.kpm
 
       - name: Upload elf
         uses: actions/upload-artifact@v4
