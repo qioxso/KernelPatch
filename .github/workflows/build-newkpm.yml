@@ -1,0 +1,102 @@
+diff --git a/c:\Users\Administrator\Code\VScode\mem\KernelPatch\.github\workflows\build-newkpm.yml b/c:\Users\Administrator\Code\VScode\mem\KernelPatch\.github\workflows\build-newkpm.yml
+new file mode 100644
+--- /dev/null
++++ b/c:\Users\Administrator\Code\VScode\mem\KernelPatch\.github\workflows\build-newkpm.yml
+@@ -0,0 +1,97 @@
++name: Build newkpm
++
++on:
++  workflow_dispatch:
++  push:
++    paths:
++      - ".github/workflows/build-newkpm.yml"
++      - "kpms/newkpm/**"
++      - "kernel/**"
++      - "version"
++  pull_request:
++    paths:
++      - ".github/workflows/build-newkpm.yml"
++      - "kpms/newkpm/**"
++      - "kernel/**"
++      - "version"
++
++jobs:
++  build-newkpm:
++    runs-on: ubuntu-latest
++    permissions:
++      contents: read
++    env:
++      TOOLCHAIN_PREFIX: ${{ github.workspace }}/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-
++    steps:
++      - name: Check out
++        uses: actions/checkout@v4
++        with:
++          submodules: recursive
++          fetch-depth: 0
++
++      - name: Install Compiler
++        shell: bash
++        run: |
++          set -euxo pipefail
++          curl -L -o arm-gnu-toolchain.tar.xz \
++            https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
++          tar -Jxf arm-gnu-toolchain.tar.xz
++          "${TOOLCHAIN_PREFIX}gcc" --version
++          "${TOOLCHAIN_PREFIX}ld" --version
++          "${TOOLCHAIN_PREFIX}readelf" --version
++
++      - name: Validate Layout
++        shell: bash
++        run: |
++          set -euxo pipefail
++          test -d kpms/newkpm
++          test -f kpms/newkpm/Makefile
++          test -f kpms/newkpm/amem_kpm.c
++          test -f kernel/include/compiler.h
++
++      - name: Build amem_kpm.kpm
++        shell: bash
++        run: |
++          set -euxo pipefail
++          make -C kpms/newkpm clean
++          make -C kpms/newkpm \
++            TARGET_COMPILE="${TOOLCHAIN_PREFIX}" \
++            KP_DIR="${GITHUB_WORKSPACE}" \
++            print-vars | tee kpms/newkpm/print-vars.txt
++          make -C kpms/newkpm \
++            TARGET_COMPILE="${TOOLCHAIN_PREFIX}" \
++            KP_DIR="${GITHUB_WORKSPACE}" \
++            2>&1 | tee kpms/newkpm/build.log
++
++      - name: Check Relocations
++        shell: bash
++        run: |
++          set -euxo pipefail
++          make -C kpms/newkpm \
++            TARGET_COMPILE="${TOOLCHAIN_PREFIX}" \
++            KP_DIR="${GITHUB_WORKSPACE}" \
++            check-relocs 2>&1 | tee kpms/newkpm/readelf-relocs.txt
++          if grep -E 'R_AARCH64_ADR_GOT_PAGE|R_AARCH64_LD64_GOT_LO12_NC' kpms/newkpm/readelf-relocs.txt; then
++            echo "Unsupported GOT relocations detected in amem_kpm.kpm"
++            exit 1
++          fi
++
++      - name: Inspect Binary
++        shell: bash
++        run: |
++          set -euxo pipefail
++          file kpms/newkpm/amem_kpm.kpm | tee kpms/newkpm/file.txt
++          "${TOOLCHAIN_PREFIX}nm" -u kpms/newkpm/amem_kpm.kpm | tee kpms/newkpm/nm-undefined.txt || true
++
++      - name: Upload Artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: newkpm-build
++          path: |
++            kpms/newkpm/amem_kpm.kpm
++            kpms/newkpm/amem_kpm.o
++            kpms/newkpm/print-vars.txt
++            kpms/newkpm/build.log
++            kpms/newkpm/readelf-relocs.txt
++            kpms/newkpm/file.txt
++            kpms/newkpm/nm-undefined.txt
