@@ -58,6 +58,10 @@ jobs:
 
           cd ../demo-syscallhook
           make
+          mv amem_kpm.kpm amem_kpm.kpm
+
+          cd ../new
+          make
           mv syscallhook.kpm demo-syscallhook.kpm
 
       - name: Upload elf
