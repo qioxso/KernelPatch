@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.6");
+KPM_VERSION("1.4.7");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -85,18 +85,6 @@ static uint64_t page_size_ = 4096;
 #define AMEM_RECORD_PHASE_PRIMARY 0u
 #define AMEM_RECORD_PHASE_REARM   1u
 
-#ifndef DBG_SPSR_SS
-#define DBG_SPSR_SS (1UL << 21)
-#endif
-
-#ifndef DBG_HOOK_HANDLED
-#define DBG_HOOK_HANDLED 0
-#endif
-
-#ifndef DBG_HOOK_ERROR
-#define DBG_HOOK_ERROR 1
-#endif
-
 #define AMEM_PATCH_SLOT_SP     31u
 #define AMEM_PATCH_SLOT_PC     32u
 #define AMEM_PATCH_SLOT_PSTATE 33u
@@ -120,11 +108,6 @@ struct perf_sample_data;
 typedef void (*perf_overflow_handler_t)(struct perf_event *bp,
                                         struct perf_sample_data *data,
                                         struct pt_regs *regs);
-
-struct step_hook_local {
-    struct list_head node;
-    int (*fn)(struct pt_regs *regs, unsigned int esr);
-};
 
 struct perf_event_attr_local {
     u32 type;
@@ -161,9 +144,6 @@ typedef int (*modify_user_hw_breakpoint_fn)(
     struct perf_event *bp,
     struct perf_event_attr_local *attr);
 typedef void (*unregister_hw_breakpoint_fn)(struct perf_event *bp);
-typedef void (*user_single_step_fn)(struct task_struct *task);
-typedef void (*register_step_hook_fn)(struct step_hook_local *hook);
-typedef void (*unregister_step_hook_fn)(struct step_hook_local *hook);
 
 struct amem_record_event {
     u64 seq;
@@ -216,16 +196,7 @@ struct amem_record_state {
 static register_user_hw_breakpoint_fn g_register_user_hw_breakpoint = NULL;
 static modify_user_hw_breakpoint_fn g_modify_user_hw_breakpoint = NULL;
 static unregister_hw_breakpoint_fn g_unregister_hw_breakpoint = NULL;
-static user_single_step_fn g_user_enable_single_step = NULL;
-static user_single_step_fn g_user_disable_single_step = NULL;
-static register_step_hook_fn g_register_step_hook = NULL;
-static unregister_step_hook_fn g_unregister_step_hook = NULL;
-static int g_step_hook_registered = 0;
 static struct amem_record_state g_record_state;
-static int amem_record_step_handler(struct pt_regs *regs, unsigned int esr);
-static struct step_hook_local g_record_step_hook = {
-    .fn = amem_record_step_handler,
-};
 
 static inline uint64_t phys_to_virt_(uint64_t phys)
 {
@@ -535,72 +506,6 @@ static u32 amem_record_apply_patch(struct pt_regs *regs,
     }
 
     return applied;
-}
-
-static int amem_record_step_handler(struct pt_regs *regs, unsigned int esr)
-{
-    struct perf_event *event = NULL;
-    unsigned long flags = 0;
-    u64 primary_addr = 0;
-    u32 len = 0;
-    u32 type = 0;
-    u32 rearm_mode = AMEM_RECORD_REARM_NONE;
-    u32 phase = AMEM_RECORD_PHASE_PRIMARY;
-    pid_t pid = 0;
-    pid_t tid = task_pid_vnr(current);
-    int enable_rc = -ENOSYS;
-
-    (void)esr;
-
-    if (!regs) {
-        return DBG_HOOK_ERROR;
-    }
-
-    flags = spin_lock_irqsave(&g_record_state.lock);
-    rearm_mode = g_record_state.rearm_mode;
-    phase = g_record_state.phase;
-    pid = g_record_state.pid;
-    event = g_record_state.event;
-    primary_addr = g_record_state.addr;
-    len = g_record_state.len;
-    type = g_record_state.type;
-    spin_unlock_irqrestore(&g_record_state.lock, flags);
-
-    if (rearm_mode != AMEM_RECORD_REARM_LINK ||
-        phase != AMEM_RECORD_PHASE_REARM ||
-        pid != tid) {
-        return DBG_HOOK_ERROR;
-    }
-
-    regs->pstate &= ~DBG_SPSR_SS;
-    if (g_user_disable_single_step) {
-        g_user_disable_single_step(current);
-    }
-
-    if (event) {
-        enable_rc = amem_record_modify_event(event, primary_addr, len, type, 0);
-    }
-
-    flags = spin_lock_irqsave(&g_record_state.lock);
-    if (g_record_state.rearm_mode == AMEM_RECORD_REARM_LINK &&
-        g_record_state.phase == AMEM_RECORD_PHASE_REARM &&
-        g_record_state.pid == tid) {
-        g_record_state.phase = AMEM_RECORD_PHASE_PRIMARY;
-        g_record_state.rearm_addr = 0;
-        g_record_state.rearm_event_disabled = 1;
-        if (enable_rc == 0) {
-            g_record_state.armed = 1;
-            g_record_state.event_disabled = 0;
-            g_record_state.rearm_count++;
-        } else {
-            g_record_state.armed = 0;
-            g_record_state.event_disabled = 1;
-            g_record_state.rearm_failures++;
-        }
-    }
-    spin_unlock_irqrestore(&g_record_state.lock, flags);
-
-    return DBG_HOOK_HANDLED;
 }
 
 static void amem_record_breakpoint_handler(struct perf_event *bp,
@@ -1313,22 +1218,6 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
         kallsyms_lookup_name("modify_user_hw_breakpoint");
     g_unregister_hw_breakpoint = (unregister_hw_breakpoint_fn)(uintptr_t)
         kallsyms_lookup_name("unregister_hw_breakpoint");
-    g_user_enable_single_step = (user_single_step_fn)(uintptr_t)
-        kallsyms_lookup_name("user_enable_single_step");
-    g_user_disable_single_step = (user_single_step_fn)(uintptr_t)
-        kallsyms_lookup_name("user_disable_single_step");
-    g_register_step_hook = (register_step_hook_fn)(uintptr_t)
-        kallsyms_lookup_name("register_user_step_hook");
-    if (!g_register_step_hook) {
-        g_register_step_hook = (register_step_hook_fn)(uintptr_t)
-            kallsyms_lookup_name("register_step_hook");
-    }
-    g_unregister_step_hook = (unregister_step_hook_fn)(uintptr_t)
-        kallsyms_lookup_name("unregister_user_step_hook");
-    if (!g_unregister_step_hook) {
-        g_unregister_step_hook = (unregister_step_hook_fn)(uintptr_t)
-            kallsyms_lookup_name("unregister_step_hook");
-    }
 
     if (!kf__raw_spin_lock_irqsave || !kf__raw_spin_unlock_irqrestore ||
         !kf___rcu_read_lock || !kf___rcu_read_unlock ||
@@ -1439,23 +1328,11 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "register_user_hw_breakpoint=%lx\n"
                 "modify_user_hw_breakpoint=%lx\n"
                 "unregister_hw_breakpoint=%lx\n"
-                "register_user_step_hook=%lx\n"
-                "unregister_user_step_hook=%lx\n"
-                "register_step_hook=%lx\n"
-                "unregister_step_hook=%lx\n"
-                "user_enable_single_step=%lx\n"
-                "user_disable_single_step=%lx\n"
                 "ptrace_hbptriggered=%lx\n"
                 "arch_ptrace=%lx\n",
                 kallsyms_lookup_name("register_user_hw_breakpoint"),
                 kallsyms_lookup_name("modify_user_hw_breakpoint"),
                 kallsyms_lookup_name("unregister_hw_breakpoint"),
-                kallsyms_lookup_name("register_user_step_hook"),
-                kallsyms_lookup_name("unregister_user_step_hook"),
-                kallsyms_lookup_name("register_step_hook"),
-                kallsyms_lookup_name("unregister_step_hook"),
-                kallsyms_lookup_name("user_enable_single_step"),
-                kallsyms_lookup_name("user_disable_single_step"),
                 kallsyms_lookup_name("ptrace_hbptriggered"),
                 kallsyms_lookup_name("arch_ptrace"));
         return write_text_response(out_msg, outlen, buf);
@@ -1499,12 +1376,6 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         used = append_symbol_line(buf, sizeof(buf), used, "register_user_hw_breakpoint");
         used = append_symbol_line(buf, sizeof(buf), used, "modify_user_hw_breakpoint");
         used = append_symbol_line(buf, sizeof(buf), used, "unregister_hw_breakpoint");
-        used = append_symbol_line(buf, sizeof(buf), used, "register_user_step_hook");
-        used = append_symbol_line(buf, sizeof(buf), used, "unregister_user_step_hook");
-        used = append_symbol_line(buf, sizeof(buf), used, "register_step_hook");
-        used = append_symbol_line(buf, sizeof(buf), used, "unregister_step_hook");
-        used = append_symbol_line(buf, sizeof(buf), used, "user_enable_single_step");
-        used = append_symbol_line(buf, sizeof(buf), used, "user_disable_single_step");
         used = append_symbol_line(buf, sizeof(buf), used, "ptrace_hbptriggered");
         used = append_symbol_line(buf, sizeof(buf), used, "arch_ptrace");
         used = append_symbol_line(buf, sizeof(buf), used, "_raw_spin_lock_irqsave");
