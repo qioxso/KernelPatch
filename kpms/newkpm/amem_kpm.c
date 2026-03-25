@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.1");
+KPM_VERSION("1.4.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -760,6 +760,9 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
     if (len != 1 && len != 2 && len != 4 && len != 8) {
         return -EINVAL;
     }
+    if (rearm_mode == AMEM_RECORD_REARM_LINK) {
+        return -EOPNOTSUPP;
+    }
 
     amem_record_disarm();
 
@@ -1277,7 +1280,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "write_hook=%d\n"
                 "read_count=%llu\n"
                 "write_count=%llu\n"
-                "debug_record_mode=prototype_exec_oneshot_linear_and_lr_rearm_patch\n"
+                "debug_record_mode=prototype_exec_oneshot_linear_patch\n"
                 "debug_interactive_mode=planned\n"
                 "record_scope=single_task_vpid\n"
                 "record_armed=%d\n"
@@ -1357,23 +1360,23 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
     if (!strcmp(args, "modes")) {
         size_t used = 0;
 
-        used = append_line(buf, sizeof(buf), used, "mode.record_only=prototype_exec_oneshot_linear_and_lr_rearm_patch");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only=prototype_exec_oneshot_linear_patch");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.pause_target=0");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.scope=single_task_vpid");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.auto_disable_on_hit=1");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.linear_rearm=addr_plus_4_temp_breakpoint");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.return_rearm=lr_temp_breakpoint");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.return_rearm=disabled_pending_safe_single_step");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x30/sp/pc/pstate");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=write_through_on_hit_no_pause");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.trace=event_ring_dump");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.arm_cmd=record-arm <tid_or_pid> <addr> [len]");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.loop_cmd=record-arm-loop <tid_or_pid> <addr> [len]");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.ret_loop_cmd=record-arm-ret-loop <tid_or_pid> <ret_addr> [len]");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.ret_loop_cmd=disabled_pending_safe_single_step");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.patch_set_cmd=record-patch-set <reg> <value>");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.patch_clear_cmd=record-patch-clear");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.read_cmd=record-read");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.best_for=high-frequency monitoring and low-pause return patching");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.best_for=high-frequency monitoring and linear low-pause patching");
         used = append_line(buf, sizeof(buf), used, "mode.interactive=planned");
         used = append_line(buf, sizeof(buf), used, "mode.interactive.pause_target=1");
         used = append_line(buf, sizeof(buf), used, "mode.interactive.view_registers=planned");
@@ -1450,13 +1453,9 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         }
 
         rc = amem_record_arm_mode((pid_t)pid, (u64)addr, len, AMEM_RECORD_REARM_LINK);
-        if (rc < 0) {
-            scnprintf(buf, sizeof(buf), "record-arm-ret-loop failed rc=%d", rc);
-            return write_text_response(out_msg, outlen, buf);
-        }
         scnprintf(buf, sizeof(buf),
-                  "record-arm-ret-loop ok pid=%d addr=%llx len=%u rearm=lr-single-slot",
-                  pid, addr, len);
+                  "record-arm-ret-loop failed rc=%d unsafe_on_current_hw_breakpoint_api",
+                  rc);
         return write_text_response(out_msg, outlen, buf);
     }
 
