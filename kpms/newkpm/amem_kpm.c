@@ -19,7 +19,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.0.0");
+KPM_VERSION("1.1.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -351,6 +351,7 @@ static void before_process_vm_writev(hook_fargs6_t *args, void *udata)
 static int write_text_response(char *__user out_msg, int outlen, const char *buf)
 {
     int len = 0;
+    int cplen = 0;
 
     if (!out_msg || outlen <= 0 || !buf) {
         return -EINVAL;
@@ -365,17 +366,41 @@ static int write_text_response(char *__user out_msg, int outlen, const char *buf
         return -EINVAL;
     }
 
-    if (compat_copy_to_user(out_msg, buf, len) != 0) {
+    cplen = compat_copy_to_user(out_msg, buf, len);
+    if (cplen <= 0) {
         return -EFAULT;
     }
 
     {
         char zero = '\0';
-        if (compat_copy_to_user(out_msg + len, &zero, 1) != 0) {
+        cplen = compat_copy_to_user(out_msg + len, &zero, 1);
+        if (cplen <= 0) {
             return -EFAULT;
         }
     }
     return 0;
+}
+
+static size_t append_line(char *buf, size_t buf_size, size_t used, const char *text)
+{
+    if (!buf || !text || used >= buf_size) {
+        return used;
+    }
+    used += scnprintf(buf + used, buf_size - used, "%s\n", text);
+    return used;
+}
+
+static size_t append_symbol_line(char *buf, size_t buf_size, size_t used, const char *name)
+{
+    unsigned long sym = 0;
+
+    if (!buf || !name || used >= buf_size) {
+        return used;
+    }
+
+    sym = kallsyms_lookup_name(name);
+    used += scnprintf(buf + used, buf_size - used, "%s=%lx\n", name, sym);
+    return used;
 }
 
 static long amem_kpm_init(const char *args, const char *event, void *__user reserved)
@@ -431,7 +456,7 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
 
 static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen)
 {
-    char buf[1024];
+    char buf[4096];
     unsigned long sym = 0;
 
     if (!args || !strcmp(args, "status")) {
@@ -441,6 +466,8 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "write_hook=%d\n"
                 "read_count=%llu\n"
                 "write_count=%llu\n"
+                "debug_record_mode=planned\n"
+                "debug_interactive_mode=planned\n"
                 "kernel=%x\n"
                 "kp=%x\n",
                 read_hook_installed,
@@ -477,6 +504,52 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         return write_text_response(out_msg, outlen, buf);
     }
 
+    if (!strcmp(args, "modes")) {
+        size_t used = 0;
+
+        used = append_line(buf, sizeof(buf), used, "mode.record_only=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.pause_target=0");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=0");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.trace=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.best_for=high-frequency monitoring");
+        used = append_line(buf, sizeof(buf), used, "mode.interactive=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.interactive.pause_target=1");
+        used = append_line(buf, sizeof(buf), used, "mode.interactive.view_registers=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.interactive.modify_registers=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.interactive.stack_snapshot=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.interactive.single_step=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.interactive.trace=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.interactive.best_for=debugging and state editing");
+        return write_text_response(out_msg, outlen, buf);
+    }
+
+    if (!strcmp(args, "debugcaps")) {
+        size_t used = 0;
+
+        used = append_symbol_line(buf, sizeof(buf), used, "register_user_hw_breakpoint");
+        used = append_symbol_line(buf, sizeof(buf), used, "modify_user_hw_breakpoint");
+        used = append_symbol_line(buf, sizeof(buf), used, "unregister_hw_breakpoint");
+        used = append_symbol_line(buf, sizeof(buf), used, "user_enable_single_step");
+        used = append_symbol_line(buf, sizeof(buf), used, "user_disable_single_step");
+        used = append_symbol_line(buf, sizeof(buf), used, "ptrace_hbptriggered");
+        used = append_symbol_line(buf, sizeof(buf), used, "arch_ptrace");
+        used = append_symbol_line(buf, sizeof(buf), used, "task_pt_regs");
+        used = append_symbol_line(buf, sizeof(buf), used, "find_task_by_vpid");
+        used = append_symbol_line(buf, sizeof(buf), used, "get_task_mm");
+        used = append_symbol_line(buf, sizeof(buf), used, "mmput");
+        used = append_symbol_line(buf, sizeof(buf), used, "__arch_copy_to_user");
+        used = append_symbol_line(buf, sizeof(buf), used, "__arch_copy_from_user");
+        used = append_symbol_line(buf, sizeof(buf), used, "access_process_vm");
+        used = append_symbol_line(buf, sizeof(buf), used, "stack_trace_save_tsk");
+        used = append_symbol_line(buf, sizeof(buf), used, "save_stack_trace_tsk");
+        used = append_symbol_line(buf, sizeof(buf), used, "stack_trace_save");
+        used = append_symbol_line(buf, sizeof(buf), used, "wake_up_state");
+        used = append_symbol_line(buf, sizeof(buf), used, "send_sig_info");
+        return write_text_response(out_msg, outlen, buf);
+    }
+
     if (!strncmp(args, "sym:", 4)) {
         sym = kallsyms_lookup_name(args + 4);
         sprintf(buf, "%lx", sym);
@@ -484,7 +557,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
     }
 
     return write_text_response(out_msg, outlen,
-                               "commands: status | reset | caps | sym:<symbol>");
+                               "commands: status | reset | caps | debugcaps | modes | sym:<symbol>");
 }
 
 static long amem_kpm_exit(void *__user reserved)
