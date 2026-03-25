@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.3.4");
+KPM_VERSION("1.4.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -79,6 +79,15 @@ static uint64_t page_size_ = 4096;
 
 #define AMEM_RECORD_STACK_DEPTH 8
 #define AMEM_RECORD_EVENT_CAP 32
+#define AMEM_RECORD_REARM_NONE   0u
+#define AMEM_RECORD_REARM_LINEAR 1u
+#define AMEM_RECORD_REARM_LINK   2u
+
+#define AMEM_PATCH_SLOT_SP     31u
+#define AMEM_PATCH_SLOT_PC     32u
+#define AMEM_PATCH_SLOT_PSTATE 33u
+#define AMEM_PATCH_SLOT_COUNT  34u
+#define AMEM_PATCH_BIT(slot)   (1ULL << (slot))
 
 #define PERF_TYPE_BREAKPOINT 5
 #define HW_BREAKPOINT_R      1
@@ -143,9 +152,11 @@ struct amem_record_event {
     u64 sp;
     u64 pstate;
     u64 regs[31];
+    u64 patch_mask;
     s32 disable_rc;
     s32 rearm_rc;
     u32 auto_disabled;
+    u32 patch_applied;
     u32 rearm_enabled;
     u32 stack_nr;
     unsigned long stack_entries[AMEM_RECORD_STACK_DEPTH];
@@ -163,6 +174,9 @@ struct amem_record_state {
     u64 rearm_addr;
     u32 len;
     u32 type;
+    u32 rearm_mode;
+    u64 patch_mask;
+    u64 patch_values[AMEM_PATCH_SLOT_COUNT];
     u64 hit_seq;
     u64 dropped;
     u64 auto_disable_count;
@@ -306,6 +320,82 @@ static void amem_record_clear_locked(void)
     memset(g_record_state.events, 0, sizeof(g_record_state.events));
 }
 
+static void amem_record_patch_clear_locked(void)
+{
+    g_record_state.patch_mask = 0;
+    memset(g_record_state.patch_values, 0, sizeof(g_record_state.patch_values));
+}
+
+static int amem_record_patch_slot_from_name(const char *name)
+{
+    int idx = 0;
+
+    if (!name || !*name) {
+        return -EINVAL;
+    }
+    if (!strcmp(name, "sp")) {
+        return AMEM_PATCH_SLOT_SP;
+    }
+    if (!strcmp(name, "pc")) {
+        return AMEM_PATCH_SLOT_PC;
+    }
+    if (!strcmp(name, "pstate")) {
+        return AMEM_PATCH_SLOT_PSTATE;
+    }
+    if (name[0] == 'x' && name[1] >= '0' && name[1] <= '9') {
+        idx = name[1] - '0';
+        if (name[2] >= '0' && name[2] <= '9') {
+            idx = idx * 10 + (name[2] - '0');
+            if (name[3] != '\0') {
+                return -EINVAL;
+            }
+        } else if (name[2] != '\0') {
+            return -EINVAL;
+        }
+        if (idx >= 0 && idx < 31) {
+            return idx;
+        }
+    }
+    return -EINVAL;
+}
+
+static size_t amem_record_append_patch_lines(char *buf, size_t buf_size, size_t used,
+                                             u64 patch_mask, const u64 *patch_values)
+{
+    u32 idx = 0;
+
+    if (!buf || !patch_values || used >= buf_size) {
+        return used;
+    }
+
+    used += scnprintf(buf + used, buf_size - used, "patch_mask=%llx\n",
+                      (unsigned long long)patch_mask);
+    if (!patch_mask) {
+        return used;
+    }
+
+    for (idx = 0; idx < AMEM_PATCH_SLOT_COUNT && used < buf_size; ++idx) {
+        if (!(patch_mask & AMEM_PATCH_BIT(idx))) {
+            continue;
+        }
+        if (idx < 31) {
+            used += scnprintf(buf + used, buf_size - used, "patch_x%u=%llx\n",
+                              idx, (unsigned long long)patch_values[idx]);
+        } else if (idx == AMEM_PATCH_SLOT_SP) {
+            used += scnprintf(buf + used, buf_size - used, "patch_sp=%llx\n",
+                              (unsigned long long)patch_values[idx]);
+        } else if (idx == AMEM_PATCH_SLOT_PC) {
+            used += scnprintf(buf + used, buf_size - used, "patch_pc=%llx\n",
+                              (unsigned long long)patch_values[idx]);
+        } else if (idx == AMEM_PATCH_SLOT_PSTATE) {
+            used += scnprintf(buf + used, buf_size - used, "patch_pstate=%llx\n",
+                              (unsigned long long)patch_values[idx]);
+        }
+    }
+
+    return used;
+}
+
 static void amem_record_copy_event(struct amem_record_event *dst,
                                    const struct amem_record_event *src)
 {
@@ -325,9 +415,11 @@ static void amem_record_copy_event(struct amem_record_event *dst,
     for (idx = 0; idx < 31; ++idx) {
         dst->regs[idx] = src->regs[idx];
     }
+    dst->patch_mask = src->patch_mask;
     dst->disable_rc = src->disable_rc;
     dst->rearm_rc = src->rearm_rc;
     dst->auto_disabled = src->auto_disabled;
+    dst->patch_applied = src->patch_applied;
     dst->rearm_enabled = src->rearm_enabled;
     dst->stack_nr = src->stack_nr;
     for (idx = 0; idx < AMEM_RECORD_STACK_DEPTH; ++idx) {
@@ -364,14 +456,68 @@ static size_t amem_record_append_reg_lines(char *buf, size_t buf_size, size_t us
     return used;
 }
 
+static void amem_record_capture_regs(struct amem_record_event *event,
+                                     const struct pt_regs *regs)
+{
+    u32 idx = 0;
+
+    if (!event || !regs) {
+        return;
+    }
+
+    event->pc = regs->pc;
+    event->sp = regs->sp;
+    event->pstate = regs->pstate;
+    for (idx = 0; idx < 31; ++idx) {
+        event->regs[idx] = regs->regs[idx];
+    }
+}
+
+static u32 amem_record_apply_patch(struct pt_regs *regs,
+                                   u64 patch_mask, const u64 *patch_values)
+{
+    u32 idx = 0;
+    u32 applied = 0;
+
+    if (!regs || !patch_values || !patch_mask) {
+        return 0;
+    }
+
+    for (idx = 0; idx < 31; ++idx) {
+        if (patch_mask & AMEM_PATCH_BIT(idx)) {
+            regs->regs[idx] = patch_values[idx];
+            applied = 1;
+        }
+    }
+    if (patch_mask & AMEM_PATCH_BIT(AMEM_PATCH_SLOT_SP)) {
+        regs->sp = patch_values[AMEM_PATCH_SLOT_SP];
+        applied = 1;
+    }
+    if (patch_mask & AMEM_PATCH_BIT(AMEM_PATCH_SLOT_PC)) {
+        regs->pc = patch_values[AMEM_PATCH_SLOT_PC];
+        applied = 1;
+    }
+    if (patch_mask & AMEM_PATCH_BIT(AMEM_PATCH_SLOT_PSTATE)) {
+        regs->pstate = patch_values[AMEM_PATCH_SLOT_PSTATE];
+        applied = 1;
+    }
+
+    return applied;
+}
+
 static void amem_record_breakpoint_handler(struct perf_event *bp,
                                            struct perf_sample_data *data,
                                            struct pt_regs *regs)
 {
     struct amem_record_event event;
     struct stack_trace trace;
+    u64 patch_values[AMEM_PATCH_SLOT_COUNT];
+    u64 patch_mask = 0;
+    u64 rearm_target = 0;
     unsigned long flags = 0;
     u32 slot = 0;
+    u32 idx = 0;
+    u32 rearm_mode = AMEM_RECORD_REARM_NONE;
     int disable_rc = -ENOSYS;
     int auto_disabled = 0;
     int rearm_rc = -ENOSYS;
@@ -381,44 +527,21 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     (void)data;
 
     memset(&event, 0, sizeof(event));
+    memset(patch_values, 0, sizeof(patch_values));
     event.bp_addr = g_record_state.addr;
     event.pid = g_record_state.pid;
     event.tid = task_pid_vnr(current);
+    flags = spin_lock_irqsave(&g_record_state.lock);
+    patch_mask = g_record_state.patch_mask;
+    rearm_mode = g_record_state.rearm_mode;
+    for (idx = 0; idx < AMEM_PATCH_SLOT_COUNT; ++idx) {
+        patch_values[idx] = g_record_state.patch_values[idx];
+    }
+    spin_unlock_irqrestore(&g_record_state.lock, flags);
     if (regs) {
-        event.pc = regs->pc;
-        event.sp = regs->sp;
-        event.pstate = regs->pstate;
-        event.regs[0] = regs->regs[0];
-        event.regs[1] = regs->regs[1];
-        event.regs[2] = regs->regs[2];
-        event.regs[3] = regs->regs[3];
-        event.regs[4] = regs->regs[4];
-        event.regs[5] = regs->regs[5];
-        event.regs[6] = regs->regs[6];
-        event.regs[7] = regs->regs[7];
-        event.regs[8] = regs->regs[8];
-        event.regs[9] = regs->regs[9];
-        event.regs[10] = regs->regs[10];
-        event.regs[11] = regs->regs[11];
-        event.regs[12] = regs->regs[12];
-        event.regs[13] = regs->regs[13];
-        event.regs[14] = regs->regs[14];
-        event.regs[15] = regs->regs[15];
-        event.regs[16] = regs->regs[16];
-        event.regs[17] = regs->regs[17];
-        event.regs[18] = regs->regs[18];
-        event.regs[19] = regs->regs[19];
-        event.regs[20] = regs->regs[20];
-        event.regs[21] = regs->regs[21];
-        event.regs[22] = regs->regs[22];
-        event.regs[23] = regs->regs[23];
-        event.regs[24] = regs->regs[24];
-        event.regs[25] = regs->regs[25];
-        event.regs[26] = regs->regs[26];
-        event.regs[27] = regs->regs[27];
-        event.regs[28] = regs->regs[28];
-        event.regs[29] = regs->regs[29];
-        event.regs[30] = regs->regs[30];
+        amem_record_capture_regs(&event, regs);
+        event.patch_mask = patch_mask;
+        event.patch_applied = amem_record_apply_patch(regs, patch_mask, patch_values);
     }
 
     if (g_record_state.auto_disable_on_hit && bp) {
@@ -434,12 +557,20 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
 
     if (auto_disabled && g_record_state.auto_rearm_on_hit &&
         g_record_state.rearm_event) {
-        rearm_rc = amem_record_modify_event(g_record_state.rearm_event,
-                                            g_record_state.rearm_addr,
-                                            g_record_state.len,
-                                            g_record_state.type, 0);
-        if (rearm_rc == 0) {
-            rearm_enabled = 1;
+        rearm_target = g_record_state.rearm_addr;
+        if (rearm_mode == AMEM_RECORD_REARM_LINK) {
+            rearm_target = event.regs[30];
+        }
+        if (rearm_target == 0) {
+            rearm_rc = -EINVAL;
+        } else {
+            rearm_rc = amem_record_modify_event(g_record_state.rearm_event,
+                                                rearm_target,
+                                                g_record_state.len,
+                                                g_record_state.type, 0);
+            if (rearm_rc == 0) {
+                rearm_enabled = 1;
+            }
         }
     }
     event.rearm_rc = rearm_rc;
@@ -463,6 +594,7 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
         g_record_state.auto_disable_failures++;
     }
     if (rearm_enabled) {
+        g_record_state.rearm_addr = rearm_target;
         g_record_state.rearm_event_disabled = 0;
     } else if (auto_disabled && g_record_state.auto_rearm_on_hit) {
         g_record_state.rearm_failures++;
@@ -513,6 +645,9 @@ static void amem_record_rearm_handler(struct perf_event *bp,
 
     flags = spin_lock_irqsave(&g_record_state.lock);
     if (rearm_disabled) {
+        if (g_record_state.rearm_mode == AMEM_RECORD_REARM_LINK) {
+            g_record_state.rearm_addr = 0;
+        }
         g_record_state.rearm_event_disabled = 1;
     } else {
         g_record_state.rearm_failures++;
@@ -548,6 +683,7 @@ static int amem_record_disarm(void)
     g_record_state.rearm_addr = 0;
     g_record_state.len = 0;
     g_record_state.type = 0;
+    g_record_state.rearm_mode = AMEM_RECORD_REARM_NONE;
     spin_unlock_irqrestore(&g_record_state.lock, flags);
 
     if (event && g_unregister_hw_breakpoint) {
@@ -559,7 +695,7 @@ static int amem_record_disarm(void)
     return 0;
 }
 
-static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, int auto_rearm)
+static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
 {
     struct perf_event_attr_local attr;
     struct perf_event_attr_local rearm_attr;
@@ -582,7 +718,7 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, int auto_rearm)
     amem_record_disarm();
 
     amem_record_fill_attr(&attr, addr, len, HW_BREAKPOINT_X, 0);
-    if (auto_rearm) {
+    if (rearm_mode != AMEM_RECORD_REARM_NONE) {
         amem_record_fill_attr(&rearm_attr, addr + 4, len, HW_BREAKPOINT_X, 1);
     }
 
@@ -593,7 +729,7 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, int auto_rearm)
         return -ESRCH;
     }
     event = g_register_user_hw_breakpoint(&attr, amem_record_breakpoint_handler, NULL, task);
-    if (!IS_ERR_OR_NULL(event) && auto_rearm) {
+    if (!IS_ERR_OR_NULL(event) && rearm_mode != AMEM_RECORD_REARM_NONE) {
         rearm_event = g_register_user_hw_breakpoint(&rearm_attr,
                                                     amem_record_rearm_handler,
                                                     NULL, task);
@@ -602,7 +738,7 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, int auto_rearm)
     if (IS_ERR_OR_NULL(event)) {
         return event ? (int)PTR_ERR(event) : -EINVAL;
     }
-    if (auto_rearm && IS_ERR_OR_NULL(rearm_event)) {
+    if (rearm_mode != AMEM_RECORD_REARM_NONE && IS_ERR_OR_NULL(rearm_event)) {
         if (g_unregister_hw_breakpoint) {
             g_unregister_hw_breakpoint(event);
         }
@@ -614,14 +750,15 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, int auto_rearm)
     g_record_state.rearm_event = rearm_event;
     g_record_state.armed = 1;
     g_record_state.auto_disable_on_hit = 1;
-    g_record_state.auto_rearm_on_hit = auto_rearm ? 1 : 0;
+    g_record_state.auto_rearm_on_hit = rearm_mode != AMEM_RECORD_REARM_NONE ? 1 : 0;
     g_record_state.event_disabled = 0;
-    g_record_state.rearm_event_disabled = auto_rearm ? 1 : 0;
+    g_record_state.rearm_event_disabled = rearm_mode != AMEM_RECORD_REARM_NONE ? 1 : 0;
     g_record_state.pid = pid;
     g_record_state.addr = addr;
-    g_record_state.rearm_addr = auto_rearm ? (addr + 4) : 0;
+    g_record_state.rearm_addr = rearm_mode == AMEM_RECORD_REARM_LINEAR ? (addr + 4) : 0;
     g_record_state.len = len;
     g_record_state.type = HW_BREAKPOINT_X;
+    g_record_state.rearm_mode = rearm_mode;
     g_record_state.auto_disable_count = 0;
     g_record_state.auto_disable_failures = 0;
     g_record_state.rearm_count = 0;
@@ -634,19 +771,22 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, int auto_rearm)
 
 static int amem_record_arm(pid_t pid, u64 addr, u32 len)
 {
-    return amem_record_arm_mode(pid, addr, len, 0);
+    return amem_record_arm_mode(pid, addr, len, AMEM_RECORD_REARM_NONE);
 }
 
 static size_t amem_record_dump(char *buf, size_t buf_size)
 {
     struct amem_record_event snapshot[AMEM_RECORD_EVENT_CAP];
+    u64 patch_values[AMEM_PATCH_SLOT_COUNT];
     u32 count = 0;
     u32 head = 0;
     u32 i = 0;
+    u32 rearm_mode = AMEM_RECORD_REARM_NONE;
     u64 hit_seq = 0;
     u64 dropped = 0;
     u64 auto_disable_count = 0;
     u64 auto_disable_failures = 0;
+    u64 patch_mask = 0;
     u64 rearm_count = 0;
     u64 rearm_failures = 0;
     int armed = 0;
@@ -665,6 +805,7 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
         return 0;
     }
 
+    memset(patch_values, 0, sizeof(patch_values));
     flags = spin_lock_irqsave(&g_record_state.lock);
     count = g_record_state.count;
     head = g_record_state.head;
@@ -672,6 +813,7 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     dropped = g_record_state.dropped;
     auto_disable_count = g_record_state.auto_disable_count;
     auto_disable_failures = g_record_state.auto_disable_failures;
+    patch_mask = g_record_state.patch_mask;
     rearm_count = g_record_state.rearm_count;
     rearm_failures = g_record_state.rearm_failures;
     armed = g_record_state.armed;
@@ -683,6 +825,10 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     addr = g_record_state.addr;
     rearm_addr = g_record_state.rearm_addr;
     len = g_record_state.len;
+    rearm_mode = g_record_state.rearm_mode;
+    for (i = 0; i < AMEM_PATCH_SLOT_COUNT; ++i) {
+        patch_values[i] = g_record_state.patch_values[i];
+    }
     for (i = 0; i < count; ++i) {
         amem_record_copy_event(&snapshot[i],
                                &g_record_state.events[(head + i) % AMEM_RECORD_EVENT_CAP]);
@@ -690,9 +836,9 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     spin_unlock_irqrestore(&g_record_state.lock, flags);
 
     used += scnprintf(buf + used, buf_size - used,
-                      "armed=%d\npid=%d\naddr=%llx\nrearm_addr=%llx\nlen=%u\nauto_disable_on_hit=%d\nauto_rearm_on_hit=%d\nevent_disabled=%d\nrearm_event_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nrearm_count=%llu\nrearm_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
+                      "armed=%d\npid=%d\naddr=%llx\nrearm_addr=%llx\nrearm_mode=%u\nlen=%u\nauto_disable_on_hit=%d\nauto_rearm_on_hit=%d\nevent_disabled=%d\nrearm_event_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nrearm_count=%llu\nrearm_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
                       armed, pid, (unsigned long long)addr,
-                      (unsigned long long)rearm_addr, len,
+                      (unsigned long long)rearm_addr, rearm_mode, len,
                       auto_disable_on_hit,
                       auto_rearm_on_hit,
                       event_disabled,
@@ -702,12 +848,13 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
                       (unsigned long long)rearm_count,
                       (unsigned long long)rearm_failures,
                       (unsigned long long)hit_seq, (unsigned long long)dropped, count);
+    used = amem_record_append_patch_lines(buf, buf_size, used, patch_mask, patch_values);
 
     for (i = 0; i < count && used < buf_size; ++i) {
         u32 s = 0;
         const struct amem_record_event *event = &snapshot[i];
         used += scnprintf(buf + used, buf_size - used,
-                          "event[%u]=seq:%llu pid:%d tid:%d bp:%llx pc:%llx sp:%llx pstate:%llx x0:%llx x1:%llx x2:%llx x3:%llx auto_disabled:%u disable_rc:%d rearm_enabled:%u rearm_rc:%d stack:%u\n",
+                          "event[%u]=seq:%llu pid:%d tid:%d bp:%llx pc:%llx sp:%llx pstate:%llx x0:%llx x1:%llx x2:%llx x3:%llx patch_applied:%u patch_mask:%llx auto_disabled:%u disable_rc:%d rearm_enabled:%u rearm_rc:%d stack:%u\n",
                           i,
                           (unsigned long long)event->seq,
                           event->pid,
@@ -720,6 +867,8 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
                           (unsigned long long)event->regs[1],
                           (unsigned long long)event->regs[2],
                           (unsigned long long)event->regs[3],
+                          event->patch_applied,
+                          (unsigned long long)event->patch_mask,
                           event->auto_disabled,
                           event->disable_rc,
                           event->rearm_enabled,
@@ -1079,7 +1228,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "write_hook=%d\n"
                 "read_count=%llu\n"
                 "write_count=%llu\n"
-                "debug_record_mode=prototype_exec_oneshot_and_linear_rearm\n"
+                "debug_record_mode=prototype_exec_oneshot_linear_and_lr_rearm_patch\n"
                 "debug_interactive_mode=planned\n"
                 "record_scope=single_task_vpid\n"
                 "record_armed=%d\n"
@@ -1090,7 +1239,9 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "record_pid=%d\n"
                 "record_addr=%llx\n"
                 "record_rearm_addr=%llx\n"
+                "record_rearm_mode=%u\n"
                 "record_len=%u\n"
+                "record_patch_mask=%llx\n"
                 "record_auto_disable_count=%llu\n"
                 "record_auto_disable_failures=%llu\n"
                 "record_rearm_count=%llu\n"
@@ -1112,7 +1263,9 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 g_record_state.pid,
                 (unsigned long long)g_record_state.addr,
                 (unsigned long long)g_record_state.rearm_addr,
+                g_record_state.rearm_mode,
                 g_record_state.len,
+                (unsigned long long)g_record_state.patch_mask,
                 (unsigned long long)g_record_state.auto_disable_count,
                 (unsigned long long)g_record_state.auto_disable_failures,
                 (unsigned long long)g_record_state.rearm_count,
@@ -1153,19 +1306,23 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
     if (!strcmp(args, "modes")) {
         size_t used = 0;
 
-        used = append_line(buf, sizeof(buf), used, "mode.record_only=prototype_exec_oneshot_and_linear_rearm");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only=prototype_exec_oneshot_linear_and_lr_rearm_patch");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.pause_target=0");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.scope=single_task_vpid");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.auto_disable_on_hit=1");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.linear_rearm=addr_plus_4_temp_breakpoint");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.return_rearm=lr_temp_breakpoint");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x30/sp/pc/pstate");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=0");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=write_through_on_hit_no_pause");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.trace=event_ring_dump");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.arm_cmd=record-arm <tid_or_pid> <addr> [len]");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.loop_cmd=record-arm-loop <tid_or_pid> <addr> [len]");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.ret_loop_cmd=record-arm-ret-loop <tid_or_pid> <ret_addr> [len]");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.patch_set_cmd=record-patch-set <reg> <value>");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.patch_clear_cmd=record-patch-clear");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.read_cmd=record-read");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.best_for=high-frequency monitoring");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.best_for=high-frequency monitoring and low-pause return patching");
         used = append_line(buf, sizeof(buf), used, "mode.interactive=planned");
         used = append_line(buf, sizeof(buf), used, "mode.interactive.pause_target=1");
         used = append_line(buf, sizeof(buf), used, "mode.interactive.view_registers=planned");
@@ -1219,13 +1376,35 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                                        "usage: record-arm-loop <tid_or_pid> <addr_hex> [len]");
         }
 
-        rc = amem_record_arm_mode((pid_t)pid, (u64)addr, len, 1);
+        rc = amem_record_arm_mode((pid_t)pid, (u64)addr, len, AMEM_RECORD_REARM_LINEAR);
         if (rc < 0) {
             scnprintf(buf, sizeof(buf), "record-arm-loop failed rc=%d", rc);
             return write_text_response(out_msg, outlen, buf);
         }
         scnprintf(buf, sizeof(buf), "record-arm-loop ok pid=%d addr=%llx len=%u rearm=%llx",
                   pid, addr, len, addr + 4);
+        return write_text_response(out_msg, outlen, buf);
+    }
+
+    if (!strncmp(args, "record-arm-ret-loop", 19)) {
+        int pid = 0;
+        unsigned long long addr = 0;
+        unsigned int len = 4;
+        int matched = sscanf(args + 19, "%d %llx %u", &pid, &addr, &len);
+        int rc = 0;
+
+        if (matched < 2) {
+            return write_text_response(out_msg, outlen,
+                                       "usage: record-arm-ret-loop <tid_or_pid> <ret_addr_hex> [len]");
+        }
+
+        rc = amem_record_arm_mode((pid_t)pid, (u64)addr, len, AMEM_RECORD_REARM_LINK);
+        if (rc < 0) {
+            scnprintf(buf, sizeof(buf), "record-arm-ret-loop failed rc=%d", rc);
+            return write_text_response(out_msg, outlen, buf);
+        }
+        scnprintf(buf, sizeof(buf), "record-arm-ret-loop ok pid=%d addr=%llx len=%u rearm=lr",
+                  pid, addr, len);
         return write_text_response(out_msg, outlen, buf);
     }
 
@@ -1251,6 +1430,43 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         return write_text_response(out_msg, outlen, buf);
     }
 
+    if (!strncmp(args, "record-patch-set", 16)) {
+        char reg[16];
+        long long value = 0;
+        int slot = -EINVAL;
+        int matched = 0;
+        unsigned long flags = 0;
+
+        memset(reg, 0, sizeof(reg));
+        matched = sscanf(args + 16, "%15s %lli", reg, &value);
+        if (matched < 2) {
+            return write_text_response(out_msg, outlen,
+                                       "usage: record-patch-set <reg> <value_auto_base>");
+        }
+
+        slot = amem_record_patch_slot_from_name(reg);
+        if (slot < 0) {
+            return write_text_response(out_msg, outlen,
+                                       "record-patch-set failed: unsupported reg");
+        }
+
+        flags = spin_lock_irqsave(&g_record_state.lock);
+        g_record_state.patch_mask |= AMEM_PATCH_BIT((u32)slot);
+        g_record_state.patch_values[slot] = (u64)value;
+        spin_unlock_irqrestore(&g_record_state.lock, flags);
+        scnprintf(buf, sizeof(buf), "record-patch-set ok reg=%s value=%llx",
+                  reg, (unsigned long long)((u64)value));
+        return write_text_response(out_msg, outlen, buf);
+    }
+
+    if (!strcmp(args, "record-patch-clear")) {
+        unsigned long flags = 0;
+        flags = spin_lock_irqsave(&g_record_state.lock);
+        amem_record_patch_clear_locked();
+        spin_unlock_irqrestore(&g_record_state.lock, flags);
+        return write_text_response(out_msg, outlen, "record-patch-clear ok");
+    }
+
     if (!strcmp(args, "record-disarm")) {
         amem_record_disarm();
         return write_text_response(out_msg, outlen, "record-disarm ok");
@@ -1265,24 +1481,30 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
     }
 
     if (!strcmp(args, "record-status")) {
-        scnprintf(buf, sizeof(buf),
-                  "armed=%d\npid=%d\naddr=%llx\nrearm_addr=%llx\nlen=%u\nauto_disable_on_hit=%d\nauto_rearm_on_hit=%d\nevent_disabled=%d\nrearm_event_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nrearm_count=%llu\nrearm_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
-                  g_record_state.armed,
-                  g_record_state.pid,
-                  (unsigned long long)g_record_state.addr,
-                  (unsigned long long)g_record_state.rearm_addr,
-                  g_record_state.len,
-                  g_record_state.auto_disable_on_hit,
-                  g_record_state.auto_rearm_on_hit,
-                  g_record_state.event_disabled,
-                  g_record_state.rearm_event_disabled,
-                  (unsigned long long)g_record_state.auto_disable_count,
-                  (unsigned long long)g_record_state.auto_disable_failures,
-                  (unsigned long long)g_record_state.rearm_count,
-                  (unsigned long long)g_record_state.rearm_failures,
-                  (unsigned long long)g_record_state.hit_seq,
-                  (unsigned long long)g_record_state.dropped,
-                  g_record_state.count);
+        size_t used = 0;
+
+        used += scnprintf(buf + used, sizeof(buf) - used,
+                          "armed=%d\npid=%d\naddr=%llx\nrearm_addr=%llx\nrearm_mode=%u\nlen=%u\nauto_disable_on_hit=%d\nauto_rearm_on_hit=%d\nevent_disabled=%d\nrearm_event_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nrearm_count=%llu\nrearm_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
+                          g_record_state.armed,
+                          g_record_state.pid,
+                          (unsigned long long)g_record_state.addr,
+                          (unsigned long long)g_record_state.rearm_addr,
+                          g_record_state.rearm_mode,
+                          g_record_state.len,
+                          g_record_state.auto_disable_on_hit,
+                          g_record_state.auto_rearm_on_hit,
+                          g_record_state.event_disabled,
+                          g_record_state.rearm_event_disabled,
+                          (unsigned long long)g_record_state.auto_disable_count,
+                          (unsigned long long)g_record_state.auto_disable_failures,
+                          (unsigned long long)g_record_state.rearm_count,
+                          (unsigned long long)g_record_state.rearm_failures,
+                          (unsigned long long)g_record_state.hit_seq,
+                          (unsigned long long)g_record_state.dropped,
+                          g_record_state.count);
+        used = amem_record_append_patch_lines(buf, sizeof(buf), used,
+                                              g_record_state.patch_mask,
+                                              g_record_state.patch_values);
         return write_text_response(out_msg, outlen, buf);
     }
 
@@ -1298,7 +1520,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
     }
 
     return write_text_response(out_msg, outlen,
-                               "commands: status | reset | caps | debugcaps | modes | record-arm | record-arm-loop | record-disarm | record-clear | record-status | record-read | sym:<symbol>");
+                               "commands: status | reset | caps | debugcaps | modes | record-arm | record-arm-loop | record-arm-ret-loop | record-patch-set | record-patch-clear | record-disarm | record-clear | record-status | record-read | sym:<symbol>");
 }
 
 static long amem_kpm_exit(void *__user reserved)
