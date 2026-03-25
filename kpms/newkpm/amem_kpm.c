@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.2.2");
+KPM_VERSION("1.2.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -146,6 +146,8 @@ struct amem_record_event {
     u64 x1;
     u64 x2;
     u64 x3;
+    s32 disable_rc;
+    u32 auto_disabled;
     u32 stack_nr;
     unsigned long stack_entries[AMEM_RECORD_STACK_DEPTH];
 };
@@ -153,12 +155,16 @@ struct amem_record_event {
 struct amem_record_state {
     spinlock_t lock;
     int armed;
+    int auto_disable_on_hit;
+    int event_disabled;
     pid_t pid;
     u64 addr;
     u32 len;
     u32 type;
     u64 hit_seq;
     u64 dropped;
+    u64 auto_disable_count;
+    u64 auto_disable_failures;
     u32 head;
     u32 count;
     struct perf_event *event;
@@ -252,6 +258,27 @@ static int pgtable_init(void)
     return 0;
 }
 
+static void amem_record_fill_attr(struct perf_event_attr_local *attr,
+                                  u64 addr, u32 len, u32 type, int disabled)
+{
+    if (!attr) {
+        return;
+    }
+
+    memset(attr, 0, sizeof(*attr));
+    attr->type = PERF_TYPE_BREAKPOINT;
+    attr->size = sizeof(*attr);
+    attr->sample_period = 1;
+    attr->wakeup_events = 1;
+    attr->bp_type = type;
+    attr->bp_addr = addr;
+    attr->bp_len = len;
+    attr->flags = PERF_ATTR_FLAG_EXCLUDE_KERNEL | PERF_ATTR_FLAG_EXCLUDE_HV;
+    if (disabled) {
+        attr->flags |= PERF_ATTR_FLAG_DISABLED;
+    }
+}
+
 static void amem_record_clear_locked(void)
 {
     g_record_state.hit_seq = 0;
@@ -266,9 +293,12 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
                                            struct pt_regs *regs)
 {
     struct amem_record_event event;
+    struct perf_event_attr_local attr;
     struct stack_trace trace;
     unsigned long flags = 0;
     u32 slot = 0;
+    int disable_rc = -ENOSYS;
+    int auto_disabled = 0;
 
     (void)bp;
     (void)data;
@@ -287,6 +317,17 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
         event.x3 = regs->regs[3];
     }
 
+    if (g_record_state.auto_disable_on_hit && bp && g_modify_user_hw_breakpoint) {
+        amem_record_fill_attr(&attr, g_record_state.addr, g_record_state.len,
+                              g_record_state.type, 1);
+        disable_rc = g_modify_user_hw_breakpoint(bp, &attr);
+        if (disable_rc == 0) {
+            auto_disabled = 1;
+        }
+    }
+    event.disable_rc = disable_rc;
+    event.auto_disabled = auto_disabled ? 1u : 0u;
+
     memset(&trace, 0, sizeof(trace));
     trace.nr_entries = 0;
     trace.max_entries = AMEM_RECORD_STACK_DEPTH;
@@ -297,6 +338,13 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
 
     flags = spin_lock_irqsave(&g_record_state.lock);
     event.seq = ++g_record_state.hit_seq;
+    if (auto_disabled) {
+        g_record_state.armed = 0;
+        g_record_state.event_disabled = 1;
+        g_record_state.auto_disable_count++;
+    } else if (g_record_state.auto_disable_on_hit) {
+        g_record_state.auto_disable_failures++;
+    }
     slot = (g_record_state.head + g_record_state.count) % AMEM_RECORD_EVENT_CAP;
     if (g_record_state.count == AMEM_RECORD_EVENT_CAP) {
         slot = g_record_state.head;
@@ -318,6 +366,7 @@ static int amem_record_disarm(void)
     event = g_record_state.event;
     g_record_state.event = NULL;
     g_record_state.armed = 0;
+    g_record_state.event_disabled = 0;
     g_record_state.pid = 0;
     g_record_state.addr = 0;
     g_record_state.len = 0;
@@ -350,15 +399,7 @@ static int amem_record_arm(pid_t pid, u64 addr, u32 len)
 
     amem_record_disarm();
 
-    memset(&attr, 0, sizeof(attr));
-    attr.type = PERF_TYPE_BREAKPOINT;
-    attr.size = sizeof(attr);
-    attr.sample_period = 1;
-    attr.wakeup_events = 1;
-    attr.bp_type = HW_BREAKPOINT_X;
-    attr.bp_addr = addr;
-    attr.bp_len = len;
-    attr.flags = PERF_ATTR_FLAG_EXCLUDE_KERNEL | PERF_ATTR_FLAG_EXCLUDE_HV;
+    amem_record_fill_attr(&attr, addr, len, HW_BREAKPOINT_X, 0);
 
     rcu_read_lock();
     task = find_task_by_vpid(pid);
@@ -375,10 +416,14 @@ static int amem_record_arm(pid_t pid, u64 addr, u32 len)
     flags = spin_lock_irqsave(&g_record_state.lock);
     g_record_state.event = event;
     g_record_state.armed = 1;
+    g_record_state.auto_disable_on_hit = 1;
+    g_record_state.event_disabled = 0;
     g_record_state.pid = pid;
     g_record_state.addr = addr;
     g_record_state.len = len;
     g_record_state.type = HW_BREAKPOINT_X;
+    g_record_state.auto_disable_count = 0;
+    g_record_state.auto_disable_failures = 0;
     amem_record_clear_locked();
     spin_unlock_irqrestore(&g_record_state.lock, flags);
 
@@ -393,7 +438,11 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     u32 i = 0;
     u64 hit_seq = 0;
     u64 dropped = 0;
+    u64 auto_disable_count = 0;
+    u64 auto_disable_failures = 0;
     int armed = 0;
+    int auto_disable_on_hit = 0;
+    int event_disabled = 0;
     pid_t pid = 0;
     u64 addr = 0;
     u32 len = 0;
@@ -409,7 +458,11 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     head = g_record_state.head;
     hit_seq = g_record_state.hit_seq;
     dropped = g_record_state.dropped;
+    auto_disable_count = g_record_state.auto_disable_count;
+    auto_disable_failures = g_record_state.auto_disable_failures;
     armed = g_record_state.armed;
+    auto_disable_on_hit = g_record_state.auto_disable_on_hit;
+    event_disabled = g_record_state.event_disabled;
     pid = g_record_state.pid;
     addr = g_record_state.addr;
     len = g_record_state.len;
@@ -419,15 +472,19 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     spin_unlock_irqrestore(&g_record_state.lock, flags);
 
     used += scnprintf(buf + used, buf_size - used,
-                      "armed=%d\npid=%d\naddr=%llx\nlen=%u\nhits=%llu\ndropped=%llu\ncount=%u\n",
+                      "armed=%d\npid=%d\naddr=%llx\nlen=%u\nauto_disable_on_hit=%d\nevent_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
                       armed, pid, (unsigned long long)addr, len,
+                      auto_disable_on_hit,
+                      event_disabled,
+                      (unsigned long long)auto_disable_count,
+                      (unsigned long long)auto_disable_failures,
                       (unsigned long long)hit_seq, (unsigned long long)dropped, count);
 
     for (i = 0; i < count && used < buf_size; ++i) {
         u32 s = 0;
         const struct amem_record_event *event = &snapshot[i];
         used += scnprintf(buf + used, buf_size - used,
-                          "event[%u]=seq:%llu pid:%d tid:%d bp:%llx pc:%llx sp:%llx x0:%llx x1:%llx x2:%llx x3:%llx stack:%u\n",
+                          "event[%u]=seq:%llu pid:%d tid:%d bp:%llx pc:%llx sp:%llx x0:%llx x1:%llx x2:%llx x3:%llx auto_disabled:%u disable_rc:%d stack:%u\n",
                           i,
                           (unsigned long long)event->seq,
                           event->pid,
@@ -439,6 +496,8 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
                           (unsigned long long)event->x1,
                           (unsigned long long)event->x2,
                           (unsigned long long)event->x3,
+                          event->auto_disabled,
+                          event->disable_rc,
                           event->stack_nr);
         for (s = 0; s < event->stack_nr && used < buf_size; ++s) {
             used += scnprintf(buf + used, buf_size - used,
@@ -794,9 +853,13 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "debug_interactive_mode=planned\n"
                 "record_scope=single_task_vpid\n"
                 "record_armed=%d\n"
+                "record_auto_disable_on_hit=%d\n"
+                "record_event_disabled=%d\n"
                 "record_pid=%d\n"
                 "record_addr=%llx\n"
                 "record_len=%u\n"
+                "record_auto_disable_count=%llu\n"
+                "record_auto_disable_failures=%llu\n"
                 "record_hits=%llu\n"
                 "record_dropped=%llu\n"
                 "record_count=%u\n"
@@ -807,9 +870,13 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 (unsigned long long)read_count,
                 (unsigned long long)write_count,
                 g_record_state.armed,
+                g_record_state.auto_disable_on_hit,
+                g_record_state.event_disabled,
                 g_record_state.pid,
                 (unsigned long long)g_record_state.addr,
                 g_record_state.len,
+                (unsigned long long)g_record_state.auto_disable_count,
+                (unsigned long long)g_record_state.auto_disable_failures,
                 (unsigned long long)g_record_state.hit_seq,
                 (unsigned long long)g_record_state.dropped,
                 g_record_state.count,
@@ -849,6 +916,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         used = append_line(buf, sizeof(buf), used, "mode.record_only=prototype_exec_only");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.pause_target=0");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.scope=single_task_vpid");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.auto_disable_on_hit=1");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x3/sp/pc/pstate");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=0");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
@@ -934,11 +1002,15 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
 
     if (!strcmp(args, "record-status")) {
         scnprintf(buf, sizeof(buf),
-                  "armed=%d\npid=%d\naddr=%llx\nlen=%u\nhits=%llu\ndropped=%llu\ncount=%u\n",
+                  "armed=%d\npid=%d\naddr=%llx\nlen=%u\nauto_disable_on_hit=%d\nevent_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
                   g_record_state.armed,
                   g_record_state.pid,
                   (unsigned long long)g_record_state.addr,
                   g_record_state.len,
+                  g_record_state.auto_disable_on_hit,
+                  g_record_state.event_disabled,
+                  (unsigned long long)g_record_state.auto_disable_count,
+                  (unsigned long long)g_record_state.auto_disable_failures,
                   (unsigned long long)g_record_state.hit_seq,
                   (unsigned long long)g_record_state.dropped,
                   g_record_state.count);
