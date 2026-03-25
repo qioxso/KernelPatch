@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.4");
+KPM_VERSION("1.4.5");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -695,13 +695,15 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     event.rearm_rc = rearm_rc;
     event.rearm_enabled = rearm_enabled ? 1u : 0u;
 
-    memset(&trace, 0, sizeof(trace));
-    trace.nr_entries = 0;
-    trace.max_entries = AMEM_RECORD_STACK_DEPTH;
-    trace.entries = event.stack_entries;
-    trace.skip = 0;
-    save_stack_trace_tsk(current, &trace);
-    event.stack_nr = trace.nr_entries;
+    if (rearm_mode != AMEM_RECORD_REARM_LINK) {
+        memset(&trace, 0, sizeof(trace));
+        trace.nr_entries = 0;
+        trace.max_entries = AMEM_RECORD_STACK_DEPTH;
+        trace.entries = event.stack_entries;
+        trace.skip = 0;
+        save_stack_trace_tsk(current, &trace);
+        event.stack_nr = trace.nr_entries;
+    }
 
     flags = spin_lock_irqsave(&g_record_state.lock);
     event.seq = ++g_record_state.hit_seq;
@@ -1469,6 +1471,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         used = append_line(buf, sizeof(buf), used, "mode.record_only.auto_disable_on_hit=1");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.linear_rearm=addr_plus_4_temp_breakpoint");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.return_rearm=ret_instruction_skipped_via_pc_to_lr");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.ret_loop_stack_snapshot=disabled_for_stability");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x30/sp/pc/pstate");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=write_through_on_hit_no_pause");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
