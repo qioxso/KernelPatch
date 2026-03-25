@@ -289,7 +289,7 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     save_stack_trace_tsk(current, &trace);
     event.stack_nr = trace.nr_entries;
 
-    spin_lock_irqsave(&g_record_state.lock, flags);
+    flags = spin_lock_irqsave(&g_record_state.lock);
     event.seq = ++g_record_state.hit_seq;
     slot = (g_record_state.head + g_record_state.count) % AMEM_RECORD_EVENT_CAP;
     if (g_record_state.count == AMEM_RECORD_EVENT_CAP) {
@@ -308,7 +308,7 @@ static int amem_record_disarm(void)
     struct perf_event *event = NULL;
     unsigned long flags = 0;
 
-    spin_lock_irqsave(&g_record_state.lock, flags);
+    flags = spin_lock_irqsave(&g_record_state.lock);
     event = g_record_state.event;
     g_record_state.event = NULL;
     g_record_state.armed = 0;
@@ -366,7 +366,7 @@ static int amem_record_arm(pid_t pid, u64 addr, u32 len)
         return event ? (int)PTR_ERR(event) : -EINVAL;
     }
 
-    spin_lock_irqsave(&g_record_state.lock, flags);
+    flags = spin_lock_irqsave(&g_record_state.lock);
     g_record_state.event = event;
     g_record_state.armed = 1;
     g_record_state.pid = pid;
@@ -398,7 +398,7 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
         return 0;
     }
 
-    spin_lock_irqsave(&g_record_state.lock, flags);
+    flags = spin_lock_irqsave(&g_record_state.lock);
     count = g_record_state.count;
     head = g_record_state.head;
     hit_seq = g_record_state.hit_seq;
@@ -906,7 +906,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
 
     if (!strcmp(args, "record-clear")) {
         unsigned long flags = 0;
-        spin_lock_irqsave(&g_record_state.lock, flags);
+        flags = spin_lock_irqsave(&g_record_state.lock);
         amem_record_clear_locked();
         spin_unlock_irqrestore(&g_record_state.lock, flags);
         return write_text_response(out_msg, outlen, "record-clear ok");
