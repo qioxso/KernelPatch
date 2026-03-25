@@ -10,16 +10,23 @@
 
 #include <linux/printk.h>
 #include <linux/kernel.h>
+#include <linux/err.h>
 #include <linux/mm_types.h>
+#include <linux/sched.h>
+#include <linux/rcupdate.h>
+#include <linux/spinlock.h>
+#include <linux/stacktrace.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 
 #include <asm-generic/unistd.h>
+#include <asm/current.h>
+#include <asm/ptrace.h>
 #include <common.h>
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.1.0");
+KPM_VERSION("1.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -63,6 +70,99 @@ static uint64_t page_offset = 0;
 static uint64_t page_shift_ = 12;
 static uint64_t page_level_ = 4;
 static uint64_t page_size_ = 4096;
+
+#define AMEM_RECORD_STACK_DEPTH 8
+#define AMEM_RECORD_EVENT_CAP 32
+
+#define PERF_TYPE_BREAKPOINT 5
+#define HW_BREAKPOINT_R      1
+#define HW_BREAKPOINT_W      2
+#define HW_BREAKPOINT_RW     (HW_BREAKPOINT_R | HW_BREAKPOINT_W)
+#define HW_BREAKPOINT_X      4
+
+#define PERF_ATTR_FLAG_DISABLED       (1ULL << 0)
+#define PERF_ATTR_FLAG_EXCLUDE_USER   (1ULL << 4)
+#define PERF_ATTR_FLAG_EXCLUDE_KERNEL (1ULL << 5)
+#define PERF_ATTR_FLAG_EXCLUDE_HV     (1ULL << 6)
+
+struct perf_event;
+struct perf_sample_data;
+
+typedef void (*perf_overflow_handler_t)(struct perf_event *bp,
+                                        struct perf_sample_data *data,
+                                        struct pt_regs *regs);
+
+struct perf_event_attr_local {
+    u32 type;
+    u32 size;
+    u64 config;
+    union {
+        u64 sample_period;
+        u64 sample_freq;
+    };
+    u64 sample_type;
+    u64 read_format;
+    u64 flags;
+    union {
+        u32 wakeup_events;
+        u32 wakeup_watermark;
+    };
+    u32 bp_type;
+    union {
+        u64 bp_addr;
+        u64 config1;
+    };
+    union {
+        u64 bp_len;
+        u64 config2;
+    };
+};
+
+typedef struct perf_event *(*register_user_hw_breakpoint_fn)(
+    struct perf_event_attr_local *attr,
+    perf_overflow_handler_t triggered,
+    void *context,
+    struct task_struct *tsk);
+typedef int (*modify_user_hw_breakpoint_fn)(
+    struct perf_event *bp,
+    struct perf_event_attr_local *attr);
+typedef void (*unregister_hw_breakpoint_fn)(struct perf_event *bp);
+
+struct amem_record_event {
+    u64 seq;
+    pid_t pid;
+    pid_t tid;
+    u64 bp_addr;
+    u64 pc;
+    u64 sp;
+    u64 pstate;
+    u64 x0;
+    u64 x1;
+    u64 x2;
+    u64 x3;
+    u32 stack_nr;
+    unsigned long stack_entries[AMEM_RECORD_STACK_DEPTH];
+};
+
+struct amem_record_state {
+    spinlock_t lock;
+    int armed;
+    pid_t pid;
+    u64 addr;
+    u32 len;
+    u32 type;
+    u64 hit_seq;
+    u64 dropped;
+    u32 head;
+    u32 count;
+    struct perf_event *event;
+    struct amem_record_event events[AMEM_RECORD_EVENT_CAP];
+};
+
+static register_user_hw_breakpoint_fn g_register_user_hw_breakpoint = NULL;
+static modify_user_hw_breakpoint_fn g_modify_user_hw_breakpoint = NULL;
+static unregister_hw_breakpoint_fn g_unregister_hw_breakpoint = NULL;
+static struct amem_record_state g_record_state;
 
 static inline uint64_t phys_to_virt_(uint64_t phys)
 {
@@ -144,6 +244,207 @@ static int pgtable_init(void)
     phys_offset = *kv_memstart_addr;
     page_size_ = 1ul << page_shift_;
     return 0;
+}
+
+static void amem_record_clear_locked(void)
+{
+    g_record_state.hit_seq = 0;
+    g_record_state.dropped = 0;
+    g_record_state.head = 0;
+    g_record_state.count = 0;
+    memset(g_record_state.events, 0, sizeof(g_record_state.events));
+}
+
+static void amem_record_breakpoint_handler(struct perf_event *bp,
+                                           struct perf_sample_data *data,
+                                           struct pt_regs *regs)
+{
+    struct amem_record_event event;
+    struct stack_trace trace;
+    unsigned long flags = 0;
+    u32 slot = 0;
+
+    (void)bp;
+    (void)data;
+
+    memset(&event, 0, sizeof(event));
+    event.bp_addr = g_record_state.addr;
+    event.pid = g_record_state.pid;
+    event.tid = task_pid_vnr(current);
+    if (regs) {
+        event.pc = regs->pc;
+        event.sp = regs->sp;
+        event.pstate = regs->pstate;
+        event.x0 = regs->regs[0];
+        event.x1 = regs->regs[1];
+        event.x2 = regs->regs[2];
+        event.x3 = regs->regs[3];
+    }
+
+    memset(&trace, 0, sizeof(trace));
+    trace.nr_entries = 0;
+    trace.max_entries = AMEM_RECORD_STACK_DEPTH;
+    trace.entries = event.stack_entries;
+    trace.skip = 0;
+    save_stack_trace_tsk(current, &trace);
+    event.stack_nr = trace.nr_entries;
+
+    spin_lock_irqsave(&g_record_state.lock, flags);
+    event.seq = ++g_record_state.hit_seq;
+    slot = (g_record_state.head + g_record_state.count) % AMEM_RECORD_EVENT_CAP;
+    if (g_record_state.count == AMEM_RECORD_EVENT_CAP) {
+        slot = g_record_state.head;
+        g_record_state.head = (g_record_state.head + 1) % AMEM_RECORD_EVENT_CAP;
+        g_record_state.dropped++;
+    } else {
+        g_record_state.count++;
+    }
+    g_record_state.events[slot] = event;
+    spin_unlock_irqrestore(&g_record_state.lock, flags);
+}
+
+static int amem_record_disarm(void)
+{
+    struct perf_event *event = NULL;
+    unsigned long flags = 0;
+
+    spin_lock_irqsave(&g_record_state.lock, flags);
+    event = g_record_state.event;
+    g_record_state.event = NULL;
+    g_record_state.armed = 0;
+    g_record_state.pid = 0;
+    g_record_state.addr = 0;
+    g_record_state.len = 0;
+    g_record_state.type = 0;
+    spin_unlock_irqrestore(&g_record_state.lock, flags);
+
+    if (event && g_unregister_hw_breakpoint) {
+        g_unregister_hw_breakpoint(event);
+    }
+    return 0;
+}
+
+static int amem_record_arm(pid_t pid, u64 addr, u32 len)
+{
+    struct perf_event_attr_local attr;
+    struct task_struct *task = NULL;
+    struct perf_event *event = NULL;
+    int rc = 0;
+    unsigned long flags = 0;
+
+    if (!g_register_user_hw_breakpoint || !g_unregister_hw_breakpoint) {
+        return -ENOSYS;
+    }
+    if (pid <= 0 || addr == 0) {
+        return -EINVAL;
+    }
+    if (len != 1 && len != 2 && len != 4 && len != 8) {
+        return -EINVAL;
+    }
+
+    amem_record_disarm();
+
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_BREAKPOINT;
+    attr.size = sizeof(attr);
+    attr.sample_period = 1;
+    attr.wakeup_events = 1;
+    attr.bp_type = HW_BREAKPOINT_X;
+    attr.bp_addr = addr;
+    attr.bp_len = len;
+    attr.flags = PERF_ATTR_FLAG_EXCLUDE_KERNEL | PERF_ATTR_FLAG_EXCLUDE_HV;
+
+    rcu_read_lock();
+    task = find_task_by_vpid(pid);
+    if (!task) {
+        rcu_read_unlock();
+        return -ESRCH;
+    }
+    event = g_register_user_hw_breakpoint(&attr, amem_record_breakpoint_handler, NULL, task);
+    rcu_read_unlock();
+    if (IS_ERR_OR_NULL(event)) {
+        return event ? (int)PTR_ERR(event) : -EINVAL;
+    }
+
+    spin_lock_irqsave(&g_record_state.lock, flags);
+    g_record_state.event = event;
+    g_record_state.armed = 1;
+    g_record_state.pid = pid;
+    g_record_state.addr = addr;
+    g_record_state.len = len;
+    g_record_state.type = HW_BREAKPOINT_X;
+    amem_record_clear_locked();
+    spin_unlock_irqrestore(&g_record_state.lock, flags);
+
+    return rc;
+}
+
+static size_t amem_record_dump(char *buf, size_t buf_size)
+{
+    struct amem_record_event snapshot[AMEM_RECORD_EVENT_CAP];
+    u32 count = 0;
+    u32 head = 0;
+    u32 i = 0;
+    u64 hit_seq = 0;
+    u64 dropped = 0;
+    int armed = 0;
+    pid_t pid = 0;
+    u64 addr = 0;
+    u32 len = 0;
+    size_t used = 0;
+    unsigned long flags = 0;
+
+    if (!buf || buf_size == 0) {
+        return 0;
+    }
+
+    spin_lock_irqsave(&g_record_state.lock, flags);
+    count = g_record_state.count;
+    head = g_record_state.head;
+    hit_seq = g_record_state.hit_seq;
+    dropped = g_record_state.dropped;
+    armed = g_record_state.armed;
+    pid = g_record_state.pid;
+    addr = g_record_state.addr;
+    len = g_record_state.len;
+    for (i = 0; i < count; ++i) {
+        snapshot[i] = g_record_state.events[(head + i) % AMEM_RECORD_EVENT_CAP];
+    }
+    spin_unlock_irqrestore(&g_record_state.lock, flags);
+
+    used += scnprintf(buf + used, buf_size - used,
+                      "armed=%d\npid=%d\naddr=%llx\nlen=%u\nhits=%llu\ndropped=%llu\ncount=%u\n",
+                      armed, pid, (unsigned long long)addr, len,
+                      (unsigned long long)hit_seq, (unsigned long long)dropped, count);
+
+    for (i = 0; i < count && used < buf_size; ++i) {
+        u32 s = 0;
+        const struct amem_record_event *event = &snapshot[i];
+        used += scnprintf(buf + used, buf_size - used,
+                          "event[%u]=seq:%llu pid:%d tid:%d bp:%llx pc:%llx sp:%llx x0:%llx x1:%llx x2:%llx x3:%llx stack:%u\n",
+                          i,
+                          (unsigned long long)event->seq,
+                          event->pid,
+                          event->tid,
+                          (unsigned long long)event->bp_addr,
+                          (unsigned long long)event->pc,
+                          (unsigned long long)event->sp,
+                          (unsigned long long)event->x0,
+                          (unsigned long long)event->x1,
+                          (unsigned long long)event->x2,
+                          (unsigned long long)event->x3,
+                          event->stack_nr);
+        for (s = 0; s < event->stack_nr && used < buf_size; ++s) {
+            used += scnprintf(buf + used, buf_size - used,
+                              "  stack[%u]=%lx\n", s, event->stack_entries[s]);
+        }
+    }
+
+    if (used >= buf_size) {
+        used = buf_size - 1;
+    }
+    buf[used] = '\0';
+    return used;
 }
 
 static int copy_user_iovec(struct iovec **out_iov,
@@ -413,8 +714,10 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
     pr_info("amem-kpm init: event=%s\n", event ? event : "(null)");
 
     pgtable_init();
+    spin_lock_init(&g_record_state.lock);
     kfunc_match(sprintf, NULL, 0);
     kfunc_match(find_task_by_vpid, NULL, 0);
+    kfunc_match(__task_pid_nr_ns, NULL, 0);
     kfunc_match(get_task_mm, NULL, 0);
     kfunc_match(mmput, NULL, 0);
     kfunc_match(vmalloc, NULL, 0);
@@ -422,6 +725,14 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
     kfunc_match(vfree, NULL, 0);
     kfunc_match(__arch_copy_to_user, NULL, 0);
     kfunc_match(__arch_copy_from_user, NULL, 0);
+    kfunc_match(save_stack_trace_tsk, NULL, 0);
+
+    g_register_user_hw_breakpoint = (register_user_hw_breakpoint_fn)(uintptr_t)
+        kallsyms_lookup_name("register_user_hw_breakpoint");
+    g_modify_user_hw_breakpoint = (modify_user_hw_breakpoint_fn)(uintptr_t)
+        kallsyms_lookup_name("modify_user_hw_breakpoint");
+    g_unregister_hw_breakpoint = (unregister_hw_breakpoint_fn)(uintptr_t)
+        kallsyms_lookup_name("unregister_hw_breakpoint");
 
     if (!kf_find_task_by_vpid || !kf_get_task_mm || !kf_mmput ||
         !kf___arch_copy_to_user || !kf___arch_copy_from_user) {
@@ -466,14 +777,28 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "write_hook=%d\n"
                 "read_count=%llu\n"
                 "write_count=%llu\n"
-                "debug_record_mode=planned\n"
+                "debug_record_mode=prototype_exec_only\n"
                 "debug_interactive_mode=planned\n"
+                "record_armed=%d\n"
+                "record_pid=%d\n"
+                "record_addr=%llx\n"
+                "record_len=%u\n"
+                "record_hits=%llu\n"
+                "record_dropped=%llu\n"
+                "record_count=%u\n"
                 "kernel=%x\n"
                 "kp=%x\n",
                 read_hook_installed,
                 write_hook_installed,
                 (unsigned long long)read_count,
                 (unsigned long long)write_count,
+                g_record_state.armed,
+                g_record_state.pid,
+                (unsigned long long)g_record_state.addr,
+                g_record_state.len,
+                (unsigned long long)g_record_state.hit_seq,
+                (unsigned long long)g_record_state.dropped,
+                g_record_state.count,
                 kver,
                 kpver);
         return write_text_response(out_msg, outlen, buf);
@@ -507,12 +832,14 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
     if (!strcmp(args, "modes")) {
         size_t used = 0;
 
-        used = append_line(buf, sizeof(buf), used, "mode.record_only=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only=prototype_exec_only");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.pause_target=0");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x3/sp/pc/pstate");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=0");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=planned");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.trace=planned");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.trace=event_ring_dump");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.arm_cmd=record-arm <pid> <addr> [len]");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.read_cmd=record-read");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.best_for=high-frequency monitoring");
         used = append_line(buf, sizeof(buf), used, "mode.interactive=planned");
         used = append_line(buf, sizeof(buf), used, "mode.interactive.pause_target=1");
@@ -550,6 +877,59 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         return write_text_response(out_msg, outlen, buf);
     }
 
+    if (!strncmp(args, "record-arm", 10)) {
+        int pid = 0;
+        unsigned long long addr = 0;
+        unsigned int len = 4;
+        int matched = sscanf(args + 10, "%d %llx %u", &pid, &addr, &len);
+        int rc = 0;
+
+        if (matched < 2) {
+            return write_text_response(out_msg, outlen,
+                                       "usage: record-arm <pid> <addr_hex> [len]");
+        }
+
+        rc = amem_record_arm((pid_t)pid, (u64)addr, len);
+        if (rc < 0) {
+            scnprintf(buf, sizeof(buf), "record-arm failed rc=%d", rc);
+            return write_text_response(out_msg, outlen, buf);
+        }
+        scnprintf(buf, sizeof(buf), "record-arm ok pid=%d addr=%llx len=%u",
+                  pid, addr, len);
+        return write_text_response(out_msg, outlen, buf);
+    }
+
+    if (!strcmp(args, "record-disarm")) {
+        amem_record_disarm();
+        return write_text_response(out_msg, outlen, "record-disarm ok");
+    }
+
+    if (!strcmp(args, "record-clear")) {
+        unsigned long flags = 0;
+        spin_lock_irqsave(&g_record_state.lock, flags);
+        amem_record_clear_locked();
+        spin_unlock_irqrestore(&g_record_state.lock, flags);
+        return write_text_response(out_msg, outlen, "record-clear ok");
+    }
+
+    if (!strcmp(args, "record-status")) {
+        scnprintf(buf, sizeof(buf),
+                  "armed=%d\npid=%d\naddr=%llx\nlen=%u\nhits=%llu\ndropped=%llu\ncount=%u\n",
+                  g_record_state.armed,
+                  g_record_state.pid,
+                  (unsigned long long)g_record_state.addr,
+                  g_record_state.len,
+                  (unsigned long long)g_record_state.hit_seq,
+                  (unsigned long long)g_record_state.dropped,
+                  g_record_state.count);
+        return write_text_response(out_msg, outlen, buf);
+    }
+
+    if (!strcmp(args, "record-read")) {
+        amem_record_dump(buf, sizeof(buf));
+        return write_text_response(out_msg, outlen, buf);
+    }
+
     if (!strncmp(args, "sym:", 4)) {
         sym = kallsyms_lookup_name(args + 4);
         sprintf(buf, "%lx", sym);
@@ -557,7 +937,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
     }
 
     return write_text_response(out_msg, outlen,
-                               "commands: status | reset | caps | debugcaps | modes | sym:<symbol>");
+                               "commands: status | reset | caps | debugcaps | modes | record-arm | record-disarm | record-clear | record-status | record-read | sym:<symbol>");
 }
 
 static long amem_kpm_exit(void *__user reserved)
@@ -572,6 +952,7 @@ static long amem_kpm_exit(void *__user reserved)
         inline_unhook_syscalln(__NR_process_vm_writev, before_process_vm_writev, NULL);
         write_hook_installed = 0;
     }
+    amem_record_disarm();
 
     pr_info("amem-kpm exit\n");
     return 0;
