@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.0");
+KPM_VERSION("1.4.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -82,6 +82,8 @@ static uint64_t page_size_ = 4096;
 #define AMEM_RECORD_REARM_NONE   0u
 #define AMEM_RECORD_REARM_LINEAR 1u
 #define AMEM_RECORD_REARM_LINK   2u
+#define AMEM_RECORD_PHASE_PRIMARY 0u
+#define AMEM_RECORD_PHASE_REARM   1u
 
 #define AMEM_PATCH_SLOT_SP     31u
 #define AMEM_PATCH_SLOT_PC     32u
@@ -175,6 +177,7 @@ struct amem_record_state {
     u32 len;
     u32 type;
     u32 rearm_mode;
+    u32 phase;
     u64 patch_mask;
     u64 patch_values[AMEM_PATCH_SLOT_COUNT];
     u64 hit_seq;
@@ -513,11 +516,16 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     struct stack_trace trace;
     u64 patch_values[AMEM_PATCH_SLOT_COUNT];
     u64 patch_mask = 0;
+    u64 primary_addr = 0;
+    u64 current_rearm_addr = 0;
     u64 rearm_target = 0;
     unsigned long flags = 0;
     u32 slot = 0;
     u32 idx = 0;
     u32 rearm_mode = AMEM_RECORD_REARM_NONE;
+    u32 phase = AMEM_RECORD_PHASE_PRIMARY;
+    u32 len = 0;
+    u32 type = 0;
     int disable_rc = -ENOSYS;
     int auto_disabled = 0;
     int rearm_rc = -ENOSYS;
@@ -533,21 +541,47 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     event.tid = task_pid_vnr(current);
     flags = spin_lock_irqsave(&g_record_state.lock);
     patch_mask = g_record_state.patch_mask;
+    primary_addr = g_record_state.addr;
+    current_rearm_addr = g_record_state.rearm_addr;
+    len = g_record_state.len;
+    type = g_record_state.type;
     rearm_mode = g_record_state.rearm_mode;
+    phase = g_record_state.phase;
     for (idx = 0; idx < AMEM_PATCH_SLOT_COUNT; ++idx) {
         patch_values[idx] = g_record_state.patch_values[idx];
     }
     spin_unlock_irqrestore(&g_record_state.lock, flags);
+
+    event.bp_addr = phase == AMEM_RECORD_PHASE_REARM ? current_rearm_addr : primary_addr;
+
+    if (rearm_mode == AMEM_RECORD_REARM_LINK && phase == AMEM_RECORD_PHASE_REARM) {
+        rearm_rc = amem_record_modify_event(bp, primary_addr, len, type, 0);
+        flags = spin_lock_irqsave(&g_record_state.lock);
+        if (rearm_rc == 0) {
+            g_record_state.phase = AMEM_RECORD_PHASE_PRIMARY;
+            g_record_state.armed = 1;
+            g_record_state.event_disabled = 0;
+            g_record_state.rearm_event_disabled = 1;
+            g_record_state.rearm_addr = 0;
+            g_record_state.rearm_count++;
+        } else {
+            g_record_state.rearm_failures++;
+        }
+        spin_unlock_irqrestore(&g_record_state.lock, flags);
+        return;
+    }
+
     if (regs) {
         amem_record_capture_regs(&event, regs);
         event.patch_mask = patch_mask;
         event.patch_applied = amem_record_apply_patch(regs, patch_mask, patch_values);
     }
 
-    if (g_record_state.auto_disable_on_hit && bp) {
-        disable_rc = amem_record_modify_event(bp, g_record_state.addr,
-                                              g_record_state.len,
-                                              g_record_state.type, 1);
+    if (rearm_mode == AMEM_RECORD_REARM_LINK && bp) {
+        auto_disabled = 1;
+        disable_rc = 0;
+    } else if (g_record_state.auto_disable_on_hit && bp) {
+        disable_rc = amem_record_modify_event(bp, primary_addr, len, type, 1);
         if (disable_rc == 0) {
             auto_disabled = 1;
         }
@@ -556,18 +590,26 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     event.auto_disabled = auto_disabled ? 1u : 0u;
 
     if (auto_disabled && g_record_state.auto_rearm_on_hit &&
-        g_record_state.rearm_event) {
-        rearm_target = g_record_state.rearm_addr;
-        if (rearm_mode == AMEM_RECORD_REARM_LINK) {
-            rearm_target = event.regs[30];
+        rearm_mode == AMEM_RECORD_REARM_LINK && bp) {
+        rearm_target = (patch_mask & AMEM_PATCH_BIT(AMEM_PATCH_SLOT_PC))
+            ? regs->pc
+            : regs->regs[30];
+        if (rearm_target == 0 || rearm_target == primary_addr) {
+            rearm_rc = -EINVAL;
+        } else {
+            rearm_rc = amem_record_modify_event(bp, rearm_target, len, type, 0);
+            if (rearm_rc == 0) {
+                rearm_enabled = 1;
+            }
         }
+    } else if (auto_disabled && g_record_state.auto_rearm_on_hit &&
+               g_record_state.rearm_event) {
+        rearm_target = current_rearm_addr;
         if (rearm_target == 0) {
             rearm_rc = -EINVAL;
         } else {
             rearm_rc = amem_record_modify_event(g_record_state.rearm_event,
-                                                rearm_target,
-                                                g_record_state.len,
-                                                g_record_state.type, 0);
+                                                rearm_target, len, type, 0);
             if (rearm_rc == 0) {
                 rearm_enabled = 1;
             }
@@ -595,6 +637,9 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     }
     if (rearm_enabled) {
         g_record_state.rearm_addr = rearm_target;
+        g_record_state.phase = rearm_mode == AMEM_RECORD_REARM_LINK
+            ? AMEM_RECORD_PHASE_REARM
+            : AMEM_RECORD_PHASE_PRIMARY;
         g_record_state.rearm_event_disabled = 0;
     } else if (auto_disabled && g_record_state.auto_rearm_on_hit) {
         g_record_state.rearm_failures++;
@@ -684,6 +729,7 @@ static int amem_record_disarm(void)
     g_record_state.len = 0;
     g_record_state.type = 0;
     g_record_state.rearm_mode = AMEM_RECORD_REARM_NONE;
+    g_record_state.phase = AMEM_RECORD_PHASE_PRIMARY;
     spin_unlock_irqrestore(&g_record_state.lock, flags);
 
     if (event && g_unregister_hw_breakpoint) {
@@ -718,7 +764,7 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
     amem_record_disarm();
 
     amem_record_fill_attr(&attr, addr, len, HW_BREAKPOINT_X, 0);
-    if (rearm_mode != AMEM_RECORD_REARM_NONE) {
+    if (rearm_mode == AMEM_RECORD_REARM_LINEAR) {
         amem_record_fill_attr(&rearm_attr, addr + 4, len, HW_BREAKPOINT_X, 1);
     }
 
@@ -729,7 +775,7 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
         return -ESRCH;
     }
     event = g_register_user_hw_breakpoint(&attr, amem_record_breakpoint_handler, NULL, task);
-    if (!IS_ERR_OR_NULL(event) && rearm_mode != AMEM_RECORD_REARM_NONE) {
+    if (!IS_ERR_OR_NULL(event) && rearm_mode == AMEM_RECORD_REARM_LINEAR) {
         rearm_event = g_register_user_hw_breakpoint(&rearm_attr,
                                                     amem_record_rearm_handler,
                                                     NULL, task);
@@ -738,7 +784,7 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
     if (IS_ERR_OR_NULL(event)) {
         return event ? (int)PTR_ERR(event) : -EINVAL;
     }
-    if (rearm_mode != AMEM_RECORD_REARM_NONE && IS_ERR_OR_NULL(rearm_event)) {
+    if (rearm_mode == AMEM_RECORD_REARM_LINEAR && IS_ERR_OR_NULL(rearm_event)) {
         if (g_unregister_hw_breakpoint) {
             g_unregister_hw_breakpoint(event);
         }
@@ -759,6 +805,7 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
     g_record_state.len = len;
     g_record_state.type = HW_BREAKPOINT_X;
     g_record_state.rearm_mode = rearm_mode;
+    g_record_state.phase = AMEM_RECORD_PHASE_PRIMARY;
     g_record_state.auto_disable_count = 0;
     g_record_state.auto_disable_failures = 0;
     g_record_state.rearm_count = 0;
@@ -781,6 +828,7 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     u32 count = 0;
     u32 head = 0;
     u32 i = 0;
+    u32 phase = AMEM_RECORD_PHASE_PRIMARY;
     u32 rearm_mode = AMEM_RECORD_REARM_NONE;
     u64 hit_seq = 0;
     u64 dropped = 0;
@@ -824,6 +872,7 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     pid = g_record_state.pid;
     addr = g_record_state.addr;
     rearm_addr = g_record_state.rearm_addr;
+    phase = g_record_state.phase;
     len = g_record_state.len;
     rearm_mode = g_record_state.rearm_mode;
     for (i = 0; i < AMEM_PATCH_SLOT_COUNT; ++i) {
@@ -836,9 +885,9 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     spin_unlock_irqrestore(&g_record_state.lock, flags);
 
     used += scnprintf(buf + used, buf_size - used,
-                      "armed=%d\npid=%d\naddr=%llx\nrearm_addr=%llx\nrearm_mode=%u\nlen=%u\nauto_disable_on_hit=%d\nauto_rearm_on_hit=%d\nevent_disabled=%d\nrearm_event_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nrearm_count=%llu\nrearm_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
+                      "armed=%d\npid=%d\naddr=%llx\nrearm_addr=%llx\nrearm_mode=%u\nphase=%u\nlen=%u\nauto_disable_on_hit=%d\nauto_rearm_on_hit=%d\nevent_disabled=%d\nrearm_event_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nrearm_count=%llu\nrearm_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
                       armed, pid, (unsigned long long)addr,
-                      (unsigned long long)rearm_addr, rearm_mode, len,
+                      (unsigned long long)rearm_addr, rearm_mode, phase, len,
                       auto_disable_on_hit,
                       auto_rearm_on_hit,
                       event_disabled,
@@ -1240,6 +1289,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "record_addr=%llx\n"
                 "record_rearm_addr=%llx\n"
                 "record_rearm_mode=%u\n"
+                "record_phase=%u\n"
                 "record_len=%u\n"
                 "record_patch_mask=%llx\n"
                 "record_auto_disable_count=%llu\n"
@@ -1264,6 +1314,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 (unsigned long long)g_record_state.addr,
                 (unsigned long long)g_record_state.rearm_addr,
                 g_record_state.rearm_mode,
+                g_record_state.phase,
                 g_record_state.len,
                 (unsigned long long)g_record_state.patch_mask,
                 (unsigned long long)g_record_state.auto_disable_count,
@@ -1403,7 +1454,8 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
             scnprintf(buf, sizeof(buf), "record-arm-ret-loop failed rc=%d", rc);
             return write_text_response(out_msg, outlen, buf);
         }
-        scnprintf(buf, sizeof(buf), "record-arm-ret-loop ok pid=%d addr=%llx len=%u rearm=lr",
+        scnprintf(buf, sizeof(buf),
+                  "record-arm-ret-loop ok pid=%d addr=%llx len=%u rearm=lr-single-slot",
                   pid, addr, len);
         return write_text_response(out_msg, outlen, buf);
     }
@@ -1484,12 +1536,13 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         size_t used = 0;
 
         used += scnprintf(buf + used, sizeof(buf) - used,
-                          "armed=%d\npid=%d\naddr=%llx\nrearm_addr=%llx\nrearm_mode=%u\nlen=%u\nauto_disable_on_hit=%d\nauto_rearm_on_hit=%d\nevent_disabled=%d\nrearm_event_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nrearm_count=%llu\nrearm_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
+                          "armed=%d\npid=%d\naddr=%llx\nrearm_addr=%llx\nrearm_mode=%u\nphase=%u\nlen=%u\nauto_disable_on_hit=%d\nauto_rearm_on_hit=%d\nevent_disabled=%d\nrearm_event_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nrearm_count=%llu\nrearm_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
                           g_record_state.armed,
                           g_record_state.pid,
                           (unsigned long long)g_record_state.addr,
                           (unsigned long long)g_record_state.rearm_addr,
                           g_record_state.rearm_mode,
+                          g_record_state.phase,
                           g_record_state.len,
                           g_record_state.auto_disable_on_hit,
                           g_record_state.auto_rearm_on_hit,
