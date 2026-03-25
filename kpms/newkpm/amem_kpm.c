@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.2.0");
+KPM_VERSION("1.2.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -49,7 +49,12 @@ struct iovec {
 #define UIO_MAXIOV 1024
 
 int kfunc_def(sprintf)(char *buf, const char *fmt, ...);
+unsigned long kfunc_def(_raw_spin_lock_irqsave)(raw_spinlock_t *lock);
+void kfunc_def(_raw_spin_unlock_irqrestore)(raw_spinlock_t *lock, unsigned long flags);
+void kfunc_def(__rcu_read_lock)(void);
+void kfunc_def(__rcu_read_unlock)(void);
 struct task_struct *kfunc_def(find_task_by_vpid)(pid_t pid);
+pid_t kfunc_def(__task_pid_nr_ns)(struct task_struct *task, enum pid_type type, struct pid_namespace *ns);
 struct mm_struct *kfunc_def(get_task_mm)(struct task_struct *task);
 void kfunc_def(mmput)(struct mm_struct *mm);
 void *kfunc_def(vmalloc)(unsigned long size);
@@ -57,6 +62,7 @@ void *kfunc_def(vmalloc_noprof)(unsigned long size);
 void kfunc_def(vfree)(const void *addr);
 unsigned long kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, unsigned long n);
 unsigned long kfunc_def(__arch_copy_from_user)(void *to, const void __user *from, unsigned long n);
+void kfunc_def(save_stack_trace_tsk)(struct task_struct *tsk, struct stack_trace *trace);
 
 u64 kvar_def(memstart_addr);
 
@@ -716,6 +722,10 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
     pgtable_init();
     spin_lock_init(&g_record_state.lock);
     kfunc_match(sprintf, NULL, 0);
+    kfunc_match(_raw_spin_lock_irqsave, NULL, 0);
+    kfunc_match(_raw_spin_unlock_irqrestore, NULL, 0);
+    kfunc_match(__rcu_read_lock, NULL, 0);
+    kfunc_match(__rcu_read_unlock, NULL, 0);
     kfunc_match(find_task_by_vpid, NULL, 0);
     kfunc_match(__task_pid_nr_ns, NULL, 0);
     kfunc_match(get_task_mm, NULL, 0);
@@ -734,7 +744,10 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
     g_unregister_hw_breakpoint = (unregister_hw_breakpoint_fn)(uintptr_t)
         kallsyms_lookup_name("unregister_hw_breakpoint");
 
-    if (!kf_find_task_by_vpid || !kf_get_task_mm || !kf_mmput ||
+    if (!kf__raw_spin_lock_irqsave || !kf__raw_spin_unlock_irqrestore ||
+        !kf___rcu_read_lock || !kf___rcu_read_unlock ||
+        !kf_find_task_by_vpid || !kf___task_pid_nr_ns ||
+        !kf_get_task_mm || !kf_mmput ||
         !kf___arch_copy_to_user || !kf___arch_copy_from_user) {
         pr_err("amem-kpm: missing required kernel symbols\n");
         return -ENOSYS;
@@ -862,8 +875,13 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         used = append_symbol_line(buf, sizeof(buf), used, "user_disable_single_step");
         used = append_symbol_line(buf, sizeof(buf), used, "ptrace_hbptriggered");
         used = append_symbol_line(buf, sizeof(buf), used, "arch_ptrace");
+        used = append_symbol_line(buf, sizeof(buf), used, "_raw_spin_lock_irqsave");
+        used = append_symbol_line(buf, sizeof(buf), used, "_raw_spin_unlock_irqrestore");
+        used = append_symbol_line(buf, sizeof(buf), used, "__rcu_read_lock");
+        used = append_symbol_line(buf, sizeof(buf), used, "__rcu_read_unlock");
         used = append_symbol_line(buf, sizeof(buf), used, "task_pt_regs");
         used = append_symbol_line(buf, sizeof(buf), used, "find_task_by_vpid");
+        used = append_symbol_line(buf, sizeof(buf), used, "__task_pid_nr_ns");
         used = append_symbol_line(buf, sizeof(buf), used, "get_task_mm");
         used = append_symbol_line(buf, sizeof(buf), used, "mmput");
         used = append_symbol_line(buf, sizeof(buf), used, "__arch_copy_to_user");
