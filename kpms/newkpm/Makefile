@@ -37,6 +37,7 @@ endif
 CFLAGS += -std=gnu11
 CFLAGS += -D__KERNEL__ -DMODULE
 CFLAGS += -fno-pic -fno-pie -fno-stack-protector -fno-common -fno-strict-aliasing
+CFLAGS += -fno-builtin -ffreestanding -fno-tree-loop-distribute-patterns
 
 INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include linux/include/uapi
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
