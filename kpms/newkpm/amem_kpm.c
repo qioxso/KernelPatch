@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.2.1");
+KPM_VERSION("1.2.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -792,6 +792,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "write_count=%llu\n"
                 "debug_record_mode=prototype_exec_only\n"
                 "debug_interactive_mode=planned\n"
+                "record_scope=single_task_vpid\n"
                 "record_armed=%d\n"
                 "record_pid=%d\n"
                 "record_addr=%llx\n"
@@ -847,11 +848,12 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
 
         used = append_line(buf, sizeof(buf), used, "mode.record_only=prototype_exec_only");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.pause_target=0");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.scope=single_task_vpid");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x3/sp/pc/pstate");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=0");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.trace=event_ring_dump");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.arm_cmd=record-arm <pid> <addr> [len]");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.arm_cmd=record-arm <tid_or_pid> <addr> [len]");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.read_cmd=record-read");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.best_for=high-frequency monitoring");
         used = append_line(buf, sizeof(buf), used, "mode.interactive=planned");
@@ -904,7 +906,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
 
         if (matched < 2) {
             return write_text_response(out_msg, outlen,
-                                       "usage: record-arm <pid> <addr_hex> [len]");
+                                       "usage: record-arm <tid_or_pid> <addr_hex> [len]");
         }
 
         rc = amem_record_arm((pid_t)pid, (u64)addr, len);
