@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.3.3");
+KPM_VERSION("1.3.4");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -306,6 +306,35 @@ static void amem_record_clear_locked(void)
     memset(g_record_state.events, 0, sizeof(g_record_state.events));
 }
 
+static void amem_record_copy_event(struct amem_record_event *dst,
+                                   const struct amem_record_event *src)
+{
+    u32 idx = 0;
+
+    if (!dst || !src) {
+        return;
+    }
+
+    dst->seq = src->seq;
+    dst->pid = src->pid;
+    dst->tid = src->tid;
+    dst->bp_addr = src->bp_addr;
+    dst->pc = src->pc;
+    dst->sp = src->sp;
+    dst->pstate = src->pstate;
+    for (idx = 0; idx < 31; ++idx) {
+        dst->regs[idx] = src->regs[idx];
+    }
+    dst->disable_rc = src->disable_rc;
+    dst->rearm_rc = src->rearm_rc;
+    dst->auto_disabled = src->auto_disabled;
+    dst->rearm_enabled = src->rearm_enabled;
+    dst->stack_nr = src->stack_nr;
+    for (idx = 0; idx < AMEM_RECORD_STACK_DEPTH; ++idx) {
+        dst->stack_entries[idx] = src->stack_entries[idx];
+    }
+}
+
 static size_t amem_record_append_reg_lines(char *buf, size_t buf_size, size_t used,
                                            const struct amem_record_event *event)
 {
@@ -446,7 +475,7 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     } else {
         g_record_state.count++;
     }
-    g_record_state.events[slot] = event;
+    amem_record_copy_event(&g_record_state.events[slot], &event);
     spin_unlock_irqrestore(&g_record_state.lock, flags);
 }
 
@@ -655,7 +684,8 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     rearm_addr = g_record_state.rearm_addr;
     len = g_record_state.len;
     for (i = 0; i < count; ++i) {
-        snapshot[i] = g_record_state.events[(head + i) % AMEM_RECORD_EVENT_CAP];
+        amem_record_copy_event(&snapshot[i],
+                               &g_record_state.events[(head + i) % AMEM_RECORD_EVENT_CAP]);
     }
     spin_unlock_irqrestore(&g_record_state.lock, flags);
 
@@ -977,6 +1007,8 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
 
     pgtable_init();
     spin_lock_init(&g_record_state.lock);
+    kfunc_match(memset, NULL, 0);
+    kfunc_match(memcpy, NULL, 0);
     kfunc_match(sprintf, NULL, 0);
     kfunc_match(_raw_spin_lock_irqsave, NULL, 0);
     kfunc_match(_raw_spin_unlock_irqrestore, NULL, 0);
@@ -1000,7 +1032,8 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
     g_unregister_hw_breakpoint = (unregister_hw_breakpoint_fn)(uintptr_t)
         kallsyms_lookup_name("unregister_hw_breakpoint");
 
-    if (!kf__raw_spin_lock_irqsave || !kf__raw_spin_unlock_irqrestore ||
+    if (!kf_memset || !kf_memcpy ||
+        !kf__raw_spin_lock_irqsave || !kf__raw_spin_unlock_irqrestore ||
         !kf___rcu_read_lock || !kf___rcu_read_unlock ||
         !kf_find_task_by_vpid || !kf___task_pid_nr_ns ||
         !kf_get_task_mm || !kf_mmput ||
