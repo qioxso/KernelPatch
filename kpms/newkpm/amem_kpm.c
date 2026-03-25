@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.3");
+KPM_VERSION("1.4.4");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -662,19 +662,19 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     event.disable_rc = disable_rc;
     event.auto_disabled = auto_disabled ? 1u : 0u;
 
-    if (auto_disabled && g_record_state.auto_rearm_on_hit &&
-        rearm_mode == AMEM_RECORD_REARM_LINK && bp) {
-        if (!regs || !g_user_enable_single_step || !g_user_disable_single_step ||
-            !g_step_hook_registered) {
-            rearm_rc = -ENOSYS;
+    if (rearm_mode == AMEM_RECORD_REARM_LINK) {
+        if (!regs) {
+            rearm_rc = -EINVAL;
+        } else if (patch_mask & AMEM_PATCH_BIT(AMEM_PATCH_SLOT_PC)) {
+            rearm_target = regs->pc;
+            rearm_rc = 0;
+            rearm_enabled = 1;
         } else {
-            rearm_target = (patch_mask & AMEM_PATCH_BIT(AMEM_PATCH_SLOT_PC))
-                ? regs->pc
-                : regs->regs[30];
+            rearm_target = regs->regs[30];
             if (rearm_target == 0 || rearm_target == primary_addr) {
                 rearm_rc = -EINVAL;
             } else {
-                g_user_enable_single_step(current);
+                regs->pc = rearm_target;
                 rearm_rc = 0;
                 rearm_enabled = 1;
             }
@@ -712,7 +712,13 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     } else if (g_record_state.auto_disable_on_hit) {
         g_record_state.auto_disable_failures++;
     }
-    if (rearm_enabled) {
+    if (rearm_mode == AMEM_RECORD_REARM_LINK) {
+        if (rearm_enabled) {
+            g_record_state.rearm_count++;
+        } else {
+            g_record_state.rearm_failures++;
+        }
+    } else if (rearm_enabled) {
         g_record_state.rearm_addr = rearm_target;
         g_record_state.phase = rearm_mode == AMEM_RECORD_REARM_LINK
             ? AMEM_RECORD_PHASE_REARM
@@ -791,11 +797,6 @@ static int amem_record_disarm(void)
     unsigned long flags = 0;
 
     flags = spin_lock_irqsave(&g_record_state.lock);
-    if (g_record_state.rearm_mode == AMEM_RECORD_REARM_LINK &&
-        g_record_state.phase == AMEM_RECORD_PHASE_REARM) {
-        spin_unlock_irqrestore(&g_record_state.lock, flags);
-        return -EBUSY;
-    }
     event = g_record_state.event;
     rearm_event = g_record_state.rearm_event;
     g_record_state.event = NULL;
@@ -842,13 +843,6 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
     if (len != 1 && len != 2 && len != 4 && len != 8) {
         return -EINVAL;
     }
-    if (rearm_mode == AMEM_RECORD_REARM_LINK &&
-        (!g_user_enable_single_step || !g_user_disable_single_step ||
-         !g_register_step_hook || !g_unregister_step_hook ||
-         !g_step_hook_registered)) {
-        return -ENOSYS;
-    }
-
     rc = amem_record_disarm();
     if (rc < 0) {
         return rc;
@@ -886,13 +880,13 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
     g_record_state.event = event;
     g_record_state.rearm_event = rearm_event;
     g_record_state.armed = 1;
-    g_record_state.auto_disable_on_hit = 1;
-    g_record_state.auto_rearm_on_hit = rearm_mode != AMEM_RECORD_REARM_NONE ? 1 : 0;
+    g_record_state.auto_disable_on_hit = rearm_mode == AMEM_RECORD_REARM_LINK ? 0 : 1;
+    g_record_state.auto_rearm_on_hit = rearm_mode == AMEM_RECORD_REARM_LINEAR ? 1 : 0;
     g_record_state.event_disabled = 0;
-    g_record_state.rearm_event_disabled = rearm_mode != AMEM_RECORD_REARM_NONE ? 1 : 0;
+    g_record_state.rearm_event_disabled = 1;
     g_record_state.pid = pid;
     g_record_state.addr = addr;
-    g_record_state.rearm_addr = rearm_mode == AMEM_RECORD_REARM_LINEAR ? (addr + 4) : 0;
+    g_record_state.rearm_addr = 0;
     g_record_state.len = len;
     g_record_state.type = HW_BREAKPOINT_X;
     g_record_state.rearm_mode = rearm_mode;
@@ -1366,11 +1360,6 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
         return -EINVAL;
     }
 
-    if (g_register_step_hook && g_unregister_step_hook) {
-        g_register_step_hook(&g_record_step_hook);
-        g_step_hook_registered = 1;
-    }
-
     return 0;
 }
 
@@ -1386,7 +1375,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "write_hook=%d\n"
                 "read_count=%llu\n"
                 "write_count=%llu\n"
-                "debug_record_mode=prototype_exec_oneshot_linear_and_ret_single_step_patch\n"
+                "debug_record_mode=prototype_exec_oneshot_linear_and_ret_pc_skip_patch\n"
                 "debug_interactive_mode=planned\n"
                 "record_scope=single_task_vpid\n"
                 "record_armed=%d\n"
@@ -1474,12 +1463,12 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
     if (!strcmp(args, "modes")) {
         size_t used = 0;
 
-        used = append_line(buf, sizeof(buf), used, "mode.record_only=prototype_exec_oneshot_linear_and_ret_single_step_patch");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only=prototype_exec_oneshot_linear_and_ret_pc_skip_patch");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.pause_target=0");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.scope=single_task_vpid");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.auto_disable_on_hit=1");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.linear_rearm=addr_plus_4_temp_breakpoint");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.return_rearm=safe_single_step_user_hook");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.return_rearm=ret_instruction_skipped_via_pc_to_lr");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x30/sp/pc/pstate");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=write_through_on_hit_no_pause");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
@@ -1576,7 +1565,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
             return write_text_response(out_msg, outlen, buf);
         }
         scnprintf(buf, sizeof(buf),
-                  "record-arm-ret-loop ok pid=%d addr=%llx len=%u rearm=single-step",
+                  "record-arm-ret-loop ok pid=%d addr=%llx len=%u rearm=pc-to-lr-skip-ret",
                   pid, addr, len);
         return write_text_response(out_msg, outlen, buf);
     }
@@ -1720,11 +1709,6 @@ static long amem_kpm_exit(void *__user reserved)
         pr_err("amem-kpm exit blocked: record state busy rc=%d\n", rc);
         return rc;
     }
-    if (g_step_hook_registered && g_unregister_step_hook) {
-        g_unregister_step_hook(&g_record_step_hook);
-        g_step_hook_registered = 0;
-    }
-
     pr_info("amem-kpm exit\n");
     return 0;
 }
