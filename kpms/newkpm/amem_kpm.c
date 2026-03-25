@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.3.2");
+KPM_VERSION("1.3.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -359,7 +359,37 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
         event.pc = regs->pc;
         event.sp = regs->sp;
         event.pstate = regs->pstate;
-        memcpy(event.regs, regs->regs, sizeof(event.regs));
+        event.regs[0] = regs->regs[0];
+        event.regs[1] = regs->regs[1];
+        event.regs[2] = regs->regs[2];
+        event.regs[3] = regs->regs[3];
+        event.regs[4] = regs->regs[4];
+        event.regs[5] = regs->regs[5];
+        event.regs[6] = regs->regs[6];
+        event.regs[7] = regs->regs[7];
+        event.regs[8] = regs->regs[8];
+        event.regs[9] = regs->regs[9];
+        event.regs[10] = regs->regs[10];
+        event.regs[11] = regs->regs[11];
+        event.regs[12] = regs->regs[12];
+        event.regs[13] = regs->regs[13];
+        event.regs[14] = regs->regs[14];
+        event.regs[15] = regs->regs[15];
+        event.regs[16] = regs->regs[16];
+        event.regs[17] = regs->regs[17];
+        event.regs[18] = regs->regs[18];
+        event.regs[19] = regs->regs[19];
+        event.regs[20] = regs->regs[20];
+        event.regs[21] = regs->regs[21];
+        event.regs[22] = regs->regs[22];
+        event.regs[23] = regs->regs[23];
+        event.regs[24] = regs->regs[24];
+        event.regs[25] = regs->regs[25];
+        event.regs[26] = regs->regs[26];
+        event.regs[27] = regs->regs[27];
+        event.regs[28] = regs->regs[28];
+        event.regs[29] = regs->regs[29];
+        event.regs[30] = regs->regs[30];
     }
 
     if (g_record_state.auto_disable_on_hit && bp) {
