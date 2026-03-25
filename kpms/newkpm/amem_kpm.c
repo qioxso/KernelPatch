@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.3.1");
+KPM_VERSION("1.3.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -142,16 +142,7 @@ struct amem_record_event {
     u64 pc;
     u64 sp;
     u64 pstate;
-    u64 x0;
-    u64 x1;
-    u64 x2;
-    u64 x3;
-    u64 x4;
-    u64 x5;
-    u64 x6;
-    u64 x7;
-    u64 x29;
-    u64 x30;
+    u64 regs[31];
     s32 disable_rc;
     s32 rearm_rc;
     u32 auto_disabled;
@@ -315,6 +306,35 @@ static void amem_record_clear_locked(void)
     memset(g_record_state.events, 0, sizeof(g_record_state.events));
 }
 
+static size_t amem_record_append_reg_lines(char *buf, size_t buf_size, size_t used,
+                                           const struct amem_record_event *event)
+{
+    u32 base = 0;
+
+    if (!buf || !event || used >= buf_size) {
+        return used;
+    }
+
+    for (base = 4; base < 31 && used < buf_size; base += 4) {
+        u32 idx = 0;
+        u32 end = base + 4;
+        if (end > 31) {
+            end = 31;
+        }
+
+        used += scnprintf(buf + used, buf_size - used, "  regs[%02u-%02u]=", base, end - 1);
+        for (idx = base; idx < end && used < buf_size; ++idx) {
+            used += scnprintf(buf + used, buf_size - used,
+                              "x%u:%llx%s",
+                              idx,
+                              (unsigned long long)event->regs[idx],
+                              (idx + 1 < end) ? " " : "\n");
+        }
+    }
+
+    return used;
+}
+
 static void amem_record_breakpoint_handler(struct perf_event *bp,
                                            struct perf_sample_data *data,
                                            struct pt_regs *regs)
@@ -339,16 +359,7 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
         event.pc = regs->pc;
         event.sp = regs->sp;
         event.pstate = regs->pstate;
-        event.x0 = regs->regs[0];
-        event.x1 = regs->regs[1];
-        event.x2 = regs->regs[2];
-        event.x3 = regs->regs[3];
-        event.x4 = regs->regs[4];
-        event.x5 = regs->regs[5];
-        event.x6 = regs->regs[6];
-        event.x7 = regs->regs[7];
-        event.x29 = regs->regs[29];
-        event.x30 = regs->regs[30];
+        memcpy(event.regs, regs->regs, sizeof(event.regs));
     }
 
     if (g_record_state.auto_disable_on_hit && bp) {
@@ -636,7 +647,7 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
         u32 s = 0;
         const struct amem_record_event *event = &snapshot[i];
         used += scnprintf(buf + used, buf_size - used,
-                          "event[%u]=seq:%llu pid:%d tid:%d bp:%llx pc:%llx sp:%llx pstate:%llx x0:%llx x1:%llx x2:%llx x3:%llx x4:%llx x5:%llx x6:%llx x7:%llx x29:%llx x30:%llx auto_disabled:%u disable_rc:%d rearm_enabled:%u rearm_rc:%d stack:%u\n",
+                          "event[%u]=seq:%llu pid:%d tid:%d bp:%llx pc:%llx sp:%llx pstate:%llx x0:%llx x1:%llx x2:%llx x3:%llx auto_disabled:%u disable_rc:%d rearm_enabled:%u rearm_rc:%d stack:%u\n",
                           i,
                           (unsigned long long)event->seq,
                           event->pid,
@@ -645,21 +656,16 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
                           (unsigned long long)event->pc,
                           (unsigned long long)event->sp,
                           (unsigned long long)event->pstate,
-                          (unsigned long long)event->x0,
-                          (unsigned long long)event->x1,
-                          (unsigned long long)event->x2,
-                          (unsigned long long)event->x3,
-                          (unsigned long long)event->x4,
-                          (unsigned long long)event->x5,
-                          (unsigned long long)event->x6,
-                          (unsigned long long)event->x7,
-                          (unsigned long long)event->x29,
-                          (unsigned long long)event->x30,
+                          (unsigned long long)event->regs[0],
+                          (unsigned long long)event->regs[1],
+                          (unsigned long long)event->regs[2],
+                          (unsigned long long)event->regs[3],
                           event->auto_disabled,
                           event->disable_rc,
                           event->rearm_enabled,
                           event->rearm_rc,
                           event->stack_nr);
+        used = amem_record_append_reg_lines(buf, buf_size, used, event);
         for (s = 0; s < event->stack_nr && used < buf_size; ++s) {
             used += scnprintf(buf + used, buf_size - used,
                               "  stack[%u]=%lx\n", s, event->stack_entries[s]);
@@ -1089,7 +1095,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         used = append_line(buf, sizeof(buf), used, "mode.record_only.scope=single_task_vpid");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.auto_disable_on_hit=1");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.linear_rearm=addr_plus_4_temp_breakpoint");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x7/x29/x30/sp/pc/pstate");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x30/sp/pc/pstate");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=0");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.trace=event_ring_dump");
