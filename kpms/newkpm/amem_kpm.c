@@ -26,7 +26,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.3.0");
+KPM_VERSION("1.3.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -146,6 +146,12 @@ struct amem_record_event {
     u64 x1;
     u64 x2;
     u64 x3;
+    u64 x4;
+    u64 x5;
+    u64 x6;
+    u64 x7;
+    u64 x29;
+    u64 x30;
     s32 disable_rc;
     s32 rearm_rc;
     u32 auto_disabled;
@@ -337,6 +343,12 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
         event.x1 = regs->regs[1];
         event.x2 = regs->regs[2];
         event.x3 = regs->regs[3];
+        event.x4 = regs->regs[4];
+        event.x5 = regs->regs[5];
+        event.x6 = regs->regs[6];
+        event.x7 = regs->regs[7];
+        event.x29 = regs->regs[29];
+        event.x30 = regs->regs[30];
     }
 
     if (g_record_state.auto_disable_on_hit && bp) {
@@ -624,7 +636,7 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
         u32 s = 0;
         const struct amem_record_event *event = &snapshot[i];
         used += scnprintf(buf + used, buf_size - used,
-                          "event[%u]=seq:%llu pid:%d tid:%d bp:%llx pc:%llx sp:%llx x0:%llx x1:%llx x2:%llx x3:%llx auto_disabled:%u disable_rc:%d rearm_enabled:%u rearm_rc:%d stack:%u\n",
+                          "event[%u]=seq:%llu pid:%d tid:%d bp:%llx pc:%llx sp:%llx pstate:%llx x0:%llx x1:%llx x2:%llx x3:%llx x4:%llx x5:%llx x6:%llx x7:%llx x29:%llx x30:%llx auto_disabled:%u disable_rc:%d rearm_enabled:%u rearm_rc:%d stack:%u\n",
                           i,
                           (unsigned long long)event->seq,
                           event->pid,
@@ -632,10 +644,17 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
                           (unsigned long long)event->bp_addr,
                           (unsigned long long)event->pc,
                           (unsigned long long)event->sp,
+                          (unsigned long long)event->pstate,
                           (unsigned long long)event->x0,
                           (unsigned long long)event->x1,
                           (unsigned long long)event->x2,
                           (unsigned long long)event->x3,
+                          (unsigned long long)event->x4,
+                          (unsigned long long)event->x5,
+                          (unsigned long long)event->x6,
+                          (unsigned long long)event->x7,
+                          (unsigned long long)event->x29,
+                          (unsigned long long)event->x30,
                           event->auto_disabled,
                           event->disable_rc,
                           event->rearm_enabled,
@@ -1070,7 +1089,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         used = append_line(buf, sizeof(buf), used, "mode.record_only.scope=single_task_vpid");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.auto_disable_on_hit=1");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.linear_rearm=addr_plus_4_temp_breakpoint");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x3/sp/pc/pstate");
+        used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x7/x29/x30/sp/pc/pstate");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=0");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.trace=event_ring_dump");
