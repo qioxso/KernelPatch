@@ -27,7 +27,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.11");
+KPM_VERSION("1.4.12");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -48,6 +48,7 @@ struct iovec {
 };
 
 #define UIO_MAXIOV 1024
+#define AMEM_ACCESS_VM_WRITE_FLAG 1u
 
 int kfunc_def(sprintf)(char *buf, const char *fmt, ...);
 unsigned long kfunc_def(_raw_spin_lock_irqsave)(raw_spinlock_t *lock);
@@ -178,6 +179,12 @@ typedef void (*unregister_hw_breakpoint_fn)(struct perf_event *bp);
 typedef void (*user_single_step_fn)(struct task_struct *task);
 typedef void (*register_step_hook_fn)(struct step_hook_local *hook);
 typedef void (*unregister_step_hook_fn)(struct step_hook_local *hook);
+typedef int (*access_process_vm_fn)(
+    struct task_struct *tsk,
+    unsigned long addr,
+    void *buf,
+    int len,
+    unsigned int gup_flags);
 
 struct amem_record_event {
     u64 seq;
@@ -267,6 +274,7 @@ static user_single_step_fn g_user_enable_single_step = NULL;
 static user_single_step_fn g_user_disable_single_step = NULL;
 static register_step_hook_fn g_register_step_hook = NULL;
 static unregister_step_hook_fn g_unregister_step_hook = NULL;
+static access_process_vm_fn g_access_process_vm = NULL;
 static int g_step_hook_registered = 0;
 static struct amem_record_state g_record_state;
 static struct amem_so_trace_state g_so_trace_state;
@@ -284,6 +292,16 @@ static int amem_so_trace_supported(void)
             g_user_disable_single_step &&
             g_register_step_hook &&
             g_unregister_step_hook) ? 1 : 0;
+}
+
+static int amem_is_legacy_kernel(void)
+{
+    return kver < VERSION(5, 4, 0) ? 1 : 0;
+}
+
+static int amem_record_handler_modify_supported(void)
+{
+    return (g_modify_user_hw_breakpoint && !amem_is_legacy_kernel()) ? 1 : 0;
 }
 
 static inline uint64_t phys_to_virt_(uint64_t phys)
@@ -744,10 +762,14 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     u32 rearm_mode = AMEM_RECORD_REARM_NONE;
     u32 len = 0;
     u32 type = 0;
+    int auto_disable_on_hit = 0;
+    int auto_rearm_on_hit = 0;
+    int handler_can_modify = 0;
     int disable_rc = -ENOSYS;
     int auto_disabled = 0;
     int rearm_rc = -ENOSYS;
     int rearm_enabled = 0;
+    struct perf_event *rearm_event = NULL;
 
     (void)bp;
     (void)data;
@@ -764,10 +786,14 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     len = g_record_state.len;
     type = g_record_state.type;
     rearm_mode = g_record_state.rearm_mode;
+    auto_disable_on_hit = g_record_state.auto_disable_on_hit;
+    auto_rearm_on_hit = g_record_state.auto_rearm_on_hit;
+    rearm_event = g_record_state.rearm_event;
     for (idx = 0; idx < AMEM_PATCH_SLOT_COUNT; ++idx) {
         patch_values[idx] = g_record_state.patch_values[idx];
     }
     spin_unlock_irqrestore(&g_record_state.lock, flags);
+    handler_can_modify = amem_record_handler_modify_supported();
 
     event.bp_addr = primary_addr;
 
@@ -777,10 +803,14 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
         event.patch_applied = amem_record_apply_patch(regs, patch_mask, patch_values);
     }
 
-    if ((g_record_state.auto_disable_on_hit || rearm_mode == AMEM_RECORD_REARM_LINK) && bp) {
-        disable_rc = amem_record_modify_event(bp, primary_addr, len, type, 1);
-        if (disable_rc == 0) {
-            auto_disabled = 1;
+    if ((auto_disable_on_hit || rearm_mode == AMEM_RECORD_REARM_LINK) && bp) {
+        if (handler_can_modify) {
+            disable_rc = amem_record_modify_event(bp, primary_addr, len, type, 1);
+            if (disable_rc == 0) {
+                auto_disabled = 1;
+            }
+        } else {
+            disable_rc = -EOPNOTSUPP;
         }
     }
     event.disable_rc = disable_rc;
@@ -801,13 +831,14 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
                 rearm_rc = 0;
             }
         }
-    } else if (auto_disabled && g_record_state.auto_rearm_on_hit &&
-               g_record_state.rearm_event) {
+    } else if (auto_disabled && auto_rearm_on_hit && rearm_event) {
         rearm_target = current_rearm_addr;
         if (rearm_target == 0) {
             rearm_rc = -EINVAL;
+        } else if (!handler_can_modify) {
+            rearm_rc = -EOPNOTSUPP;
         } else {
-            rearm_rc = amem_record_modify_event(g_record_state.rearm_event,
+            rearm_rc = amem_record_modify_event(rearm_event,
                                                 rearm_target, len, type, 0);
             if (rearm_rc == 0) {
                 rearm_enabled = 1;
@@ -817,7 +848,7 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     event.rearm_rc = rearm_rc;
     event.rearm_enabled = rearm_enabled ? 1u : 0u;
 
-    if (rearm_mode != AMEM_RECORD_REARM_LINK) {
+    if (rearm_mode != AMEM_RECORD_REARM_LINK && !amem_is_legacy_kernel()) {
         memset(&trace, 0, sizeof(trace));
         trace.nr_entries = 0;
         trace.max_entries = AMEM_RECORD_STACK_DEPTH;
@@ -833,7 +864,7 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
         g_record_state.armed = 0;
         g_record_state.event_disabled = 1;
         g_record_state.auto_disable_count++;
-    } else if (g_record_state.auto_disable_on_hit) {
+    } else if (auto_disable_on_hit) {
         g_record_state.auto_disable_failures++;
     }
     if (rearm_mode == AMEM_RECORD_REARM_LINK) {
@@ -849,7 +880,7 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
             ? AMEM_RECORD_PHASE_REARM
             : AMEM_RECORD_PHASE_PRIMARY;
         g_record_state.rearm_event_disabled = 0;
-    } else if (auto_disabled && g_record_state.auto_rearm_on_hit) {
+    } else if (auto_disabled && auto_rearm_on_hit) {
         g_record_state.rearm_failures++;
     }
     slot = (g_record_state.head + g_record_state.count) % AMEM_RECORD_EVENT_CAP;
@@ -878,19 +909,27 @@ static void amem_record_rearm_handler(struct perf_event *bp,
     (void)regs;
 
     if (bp) {
-        disable_rearm_rc = amem_record_modify_event(bp, g_record_state.rearm_addr,
-                                                    g_record_state.len,
-                                                    g_record_state.type, 1);
+        if (amem_record_handler_modify_supported()) {
+            disable_rearm_rc = amem_record_modify_event(bp, g_record_state.rearm_addr,
+                                                        g_record_state.len,
+                                                        g_record_state.type, 1);
+        } else {
+            disable_rearm_rc = -EOPNOTSUPP;
+        }
         if (disable_rearm_rc == 0) {
             rearm_disabled = 1;
         }
     }
 
     if (g_record_state.event) {
-        enable_primary_rc = amem_record_modify_event(g_record_state.event,
-                                                     g_record_state.addr,
-                                                     g_record_state.len,
-                                                     g_record_state.type, 0);
+        if (amem_record_handler_modify_supported()) {
+            enable_primary_rc = amem_record_modify_event(g_record_state.event,
+                                                         g_record_state.addr,
+                                                         g_record_state.len,
+                                                         g_record_state.type, 0);
+        } else {
+            enable_primary_rc = -EOPNOTSUPP;
+        }
         if (enable_primary_rc == 0) {
             primary_enabled = 1;
         }
@@ -956,6 +995,7 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
     struct task_struct *task = NULL;
     struct perf_event *event = NULL;
     struct perf_event *rearm_event = NULL;
+    int handler_can_modify = 0;
     int rc = 0;
     unsigned long flags = 0;
 
@@ -967,6 +1007,10 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
     }
     if (len != 1 && len != 2 && len != 4 && len != 8) {
         return -EINVAL;
+    }
+    handler_can_modify = amem_record_handler_modify_supported();
+    if (rearm_mode != AMEM_RECORD_REARM_NONE && !handler_can_modify) {
+        return -EOPNOTSUPP;
     }
     rc = amem_record_disarm();
     if (rc < 0) {
@@ -1005,10 +1049,11 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
     g_record_state.event = event;
     g_record_state.rearm_event = rearm_event;
     g_record_state.armed = 1;
-    g_record_state.auto_disable_on_hit = 1;
-    g_record_state.auto_rearm_on_hit = rearm_mode == AMEM_RECORD_REARM_LINEAR ? 1 : 0;
+    g_record_state.auto_disable_on_hit = handler_can_modify ? 1 : 0;
+    g_record_state.auto_rearm_on_hit = (handler_can_modify &&
+                                        rearm_mode == AMEM_RECORD_REARM_LINEAR) ? 1 : 0;
     g_record_state.event_disabled = 0;
-    g_record_state.rearm_event_disabled = 1;
+    g_record_state.rearm_event_disabled = rearm_mode == AMEM_RECORD_REARM_LINEAR ? 1 : 0;
     g_record_state.pid = pid;
     g_record_state.addr = addr;
     g_record_state.rearm_addr = 0;
@@ -1578,6 +1623,82 @@ static void free_user_iovec(struct iovec *iov)
     }
 }
 
+static int copy_process_bytes_access_vm(struct task_struct *task,
+                                        uint64_t remote_addr,
+                                        void __user *local_buf,
+                                        size_t len,
+                                        int write)
+{
+    void *bounce = NULL;
+    size_t copied = 0;
+    size_t bounce_size = page_size_;
+    int rc = 0;
+
+    if (!task || !g_access_process_vm) {
+        return -ENOSYS;
+    }
+    if (!kf___arch_copy_to_user || !kf___arch_copy_from_user) {
+        return -ENOSYS;
+    }
+    if (!kf_vfree || (!kf_vmalloc && !kf_vmalloc_noprof)) {
+        return -ENOSYS;
+    }
+
+    if (bounce_size == 0 || bounce_size > 65536u) {
+        bounce_size = 4096;
+    }
+
+    if (kf_vmalloc) {
+        bounce = kf_vmalloc(bounce_size);
+    } else if (kf_vmalloc_noprof) {
+        bounce = kf_vmalloc_noprof(bounce_size);
+    }
+    if (!bounce) {
+        return -ENOMEM;
+    }
+
+    while (copied < len) {
+        size_t chunk = AMEM_PAGE_MIN(len - copied, bounce_size);
+        int bytes = 0;
+        unsigned long left = 0;
+
+        if (write) {
+            left = kf___arch_copy_from_user(bounce,
+                                            (const void __user *)((uintptr_t)local_buf + copied),
+                                            chunk);
+            if (left != 0) {
+                rc = -EFAULT;
+                break;
+            }
+        }
+
+        bytes = g_access_process_vm(task,
+                                    (unsigned long)(remote_addr + copied),
+                                    bounce,
+                                    (int)chunk,
+                                    write ? AMEM_ACCESS_VM_WRITE_FLAG : 0u);
+        if (bytes != (int)chunk) {
+            rc = bytes < 0 ? bytes : -EFAULT;
+            break;
+        }
+
+        if (!write) {
+            left = kf___arch_copy_to_user((void __user *)((uintptr_t)local_buf + copied),
+                                          bounce,
+                                          chunk);
+            if (left != 0) {
+                rc = -EFAULT;
+                break;
+            }
+        }
+
+        copied += chunk;
+    }
+
+    kf_vfree(bounce);
+    return rc;
+}
+
 static int copy_process_bytes(pid_t pid, uint64_t remote_addr,
                               void __user *local_buf, size_t len, int write)
 {
@@ -1589,6 +1710,14 @@ static int copy_process_bytes(pid_t pid, uint64_t remote_addr,
     task = kf_find_task_by_vpid(pid);
     if (!task) {
         return -ESRCH;
+    }
+
+    if (g_access_process_vm) {
+        return copy_process_bytes_access_vm(task, remote_addr, local_buf, len, write);
+    }
+
+    if (!kf_get_task_mm || !kf_mmput) {
+        return -ENOSYS;
     }
 
     mm = kf_get_task_mm(task);
@@ -1647,8 +1776,10 @@ static ssize_t do_process_vm_rw(pid_t pid,
 
     (void)flags;
 
-    if (!kf_find_task_by_vpid || !kf_get_task_mm || !kf_mmput ||
-        !kf___arch_copy_to_user || !kf___arch_copy_from_user) {
+    if (!kf_find_task_by_vpid || !kf___arch_copy_to_user || !kf___arch_copy_from_user) {
+        return -ENOSYS;
+    }
+    if (!g_access_process_vm && (!kf_get_task_mm || !kf_mmput)) {
         return -ENOSYS;
     }
 
@@ -1803,7 +1934,6 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
 
     pr_info("amem-kpm init: event=%s\n", event ? event : "(null)");
 
-    pgtable_init();
     spin_lock_init(&g_record_state.lock);
     spin_lock_init(&g_so_trace_state.lock);
     kfunc_match(sprintf, NULL, 0);
@@ -1828,6 +1958,8 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
         kallsyms_lookup_name("modify_user_hw_breakpoint");
     g_unregister_hw_breakpoint = (unregister_hw_breakpoint_fn)(uintptr_t)
         kallsyms_lookup_name("unregister_hw_breakpoint");
+    g_access_process_vm = (access_process_vm_fn)(uintptr_t)
+        kallsyms_lookup_name("access_process_vm");
     if (kver >= VERSION(5, 4, 0)) {
         g_user_enable_single_step = (user_single_step_fn)(uintptr_t)
             kallsyms_lookup_name("user_enable_single_step");
@@ -1847,14 +1979,24 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
     if (!kf__raw_spin_lock_irqsave || !kf__raw_spin_unlock_irqrestore ||
         !kf___rcu_read_lock || !kf___rcu_read_unlock ||
         !kf_find_task_by_vpid || !kf___task_pid_nr_ns ||
-        !kf_get_task_mm || !kf_mmput ||
         !kf___arch_copy_to_user || !kf___arch_copy_from_user) {
         pr_err("amem-kpm: missing required kernel symbols\n");
+        return -ENOSYS;
+    }
+    if (!g_access_process_vm && (!kf_get_task_mm || !kf_mmput)) {
+        pr_err("amem-kpm: missing access_process_vm and mm walk symbols\n");
+        return -ENOSYS;
+    }
+    if (amem_is_legacy_kernel() && !g_access_process_vm) {
+        pr_err("amem-kpm: legacy kernel requires access_process_vm\n");
         return -ENOSYS;
     }
     if (!kf_vfree || (!kf_vmalloc && !kf_vmalloc_noprof)) {
         pr_err("amem-kpm: missing vmalloc/vfree symbols\n");
         return -ENOSYS;
+    }
+    if (!g_access_process_vm) {
+        pgtable_init();
     }
 
     err = inline_hook_syscalln(__NR_process_vm_readv, 6, before_process_vm_readv, NULL, NULL);
@@ -1894,6 +2036,9 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "debug_so_trace_mode=prototype_so_range_single_step_oneshot\n"
                 "debug_interactive_mode=planned\n"
                 "record_scope=single_task_vpid\n"
+                "legacy_kernel=%d\n"
+                "access_process_vm=%d\n"
+                "record_handler_modify_supported=%d\n"
                 "so_trace_supported=%d\n"
                 "so_trace_armed=%d\n"
                 "so_trace_running=%d\n"
@@ -1931,6 +2076,9 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 write_hook_installed,
                 (unsigned long long)read_count,
                 (unsigned long long)write_count,
+                amem_is_legacy_kernel(),
+                g_access_process_vm ? 1 : 0,
+                amem_record_handler_modify_supported(),
                 amem_so_trace_supported(),
                 g_so_trace_state.armed,
                 g_so_trace_state.running,
@@ -1984,6 +2132,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "unregister_step_hook=%lx\n"
                 "user_enable_single_step=%lx\n"
                 "user_disable_single_step=%lx\n"
+                "access_process_vm=%lx\n"
                 "ptrace_hbptriggered=%lx\n"
                 "arch_ptrace=%lx\n",
                 kallsyms_lookup_name("register_user_hw_breakpoint"),
@@ -1995,6 +2144,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 kallsyms_lookup_name("unregister_step_hook"),
                 kallsyms_lookup_name("user_enable_single_step"),
                 kallsyms_lookup_name("user_disable_single_step"),
+                kallsyms_lookup_name("access_process_vm"),
                 kallsyms_lookup_name("ptrace_hbptriggered"),
                 kallsyms_lookup_name("arch_ptrace"));
         return write_text_response(out_msg, outlen, buf);
@@ -2006,17 +2156,33 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         used = append_line(buf, sizeof(buf), used, "mode.record_only=prototype_exec_oneshot_linear_and_ret_manual_rearm_patch");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.pause_target=0");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.scope=single_task_vpid");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.auto_disable_on_hit=1");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.linear_rearm=addr_plus_4_temp_breakpoint");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.return_rearm=manual_rearm_after_each_hit");
+        used = append_line(buf, sizeof(buf), used, "mode.process_vm.copy_backend=access_process_vm_preferred");
+        if (amem_record_handler_modify_supported()) {
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.auto_disable_on_hit=1");
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.linear_rearm=addr_plus_4_temp_breakpoint");
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.return_rearm=manual_rearm_after_each_hit");
+        } else {
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.auto_disable_on_hit=0_on_legacy_kernel");
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.linear_rearm=disabled_on_legacy_kernel");
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.return_rearm=disabled_on_legacy_kernel");
+        }
         used = append_line(buf, sizeof(buf), used, "mode.record_only.ret_loop_stack_snapshot=disabled_for_stability");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.view_registers=x0-x30/sp/pc/pstate");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.modify_registers=write_through_on_hit_no_pause");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
+        if (amem_is_legacy_kernel()) {
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=disabled_on_legacy_kernel");
+        } else {
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
+        }
         used = append_line(buf, sizeof(buf), used, "mode.record_only.trace=event_ring_dump");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.arm_cmd=record-arm <tid_or_pid> <addr> [len]");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.loop_cmd=record-arm-loop <tid_or_pid> <addr> [len]");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.ret_loop_cmd=record-arm-ret-loop <tid_or_pid> <ret_addr> [len]");
+        if (amem_record_handler_modify_supported()) {
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.loop_cmd=record-arm-loop <tid_or_pid> <addr> [len]");
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.ret_loop_cmd=record-arm-ret-loop <tid_or_pid> <ret_addr> [len]");
+        } else {
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.loop_cmd=record-arm-loop (unsupported_on_legacy_kernel)");
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.ret_loop_cmd=record-arm-ret-loop (unsupported_on_legacy_kernel)");
+        }
         used = append_line(buf, sizeof(buf), used, "mode.record_only.patch_set_cmd=record-patch-set <reg> <value>");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.patch_clear_cmd=record-patch-clear");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.read_cmd=record-read");
@@ -2091,7 +2257,13 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
 
         rc = amem_record_arm_mode((pid_t)pid, (u64)addr, len, AMEM_RECORD_REARM_LINEAR);
         if (rc < 0) {
-            scnprintf(buf, sizeof(buf), "record-arm-loop failed rc=%d", rc);
+            if (rc == -EOPNOTSUPP) {
+                scnprintf(buf, sizeof(buf),
+                          "record-arm-loop failed rc=%d unsupported_on_kernel_lt_5_4",
+                          rc);
+            } else {
+                scnprintf(buf, sizeof(buf), "record-arm-loop failed rc=%d", rc);
+            }
             return write_text_response(out_msg, outlen, buf);
         }
         scnprintf(buf, sizeof(buf), "record-arm-loop ok pid=%d addr=%llx len=%u rearm=%llx",
@@ -2113,7 +2285,13 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
 
         rc = amem_record_arm_mode((pid_t)pid, (u64)addr, len, AMEM_RECORD_REARM_LINK);
         if (rc < 0) {
-            scnprintf(buf, sizeof(buf), "record-arm-ret-loop failed rc=%d", rc);
+            if (rc == -EOPNOTSUPP) {
+                scnprintf(buf, sizeof(buf),
+                          "record-arm-ret-loop failed rc=%d unsupported_on_kernel_lt_5_4",
+                          rc);
+            } else {
+                scnprintf(buf, sizeof(buf), "record-arm-ret-loop failed rc=%d", rc);
+            }
             return write_text_response(out_msg, outlen, buf);
         }
         scnprintf(buf, sizeof(buf),
@@ -2139,8 +2317,14 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
             scnprintf(buf, sizeof(buf), "record-arm failed rc=%d", rc);
             return write_text_response(out_msg, outlen, buf);
         }
-        scnprintf(buf, sizeof(buf), "record-arm ok pid=%d addr=%llx len=%u",
-                  pid, addr, len);
+        if (amem_record_handler_modify_supported()) {
+            scnprintf(buf, sizeof(buf), "record-arm ok pid=%d addr=%llx len=%u",
+                      pid, addr, len);
+        } else {
+            scnprintf(buf, sizeof(buf),
+                      "record-arm ok pid=%d addr=%llx len=%u legacy_auto_disable=0",
+                      pid, addr, len);
+        }
         return write_text_response(out_msg, outlen, buf);
     }
 
@@ -2202,7 +2386,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         size_t used = 0;
 
         used += scnprintf(buf + used, sizeof(buf) - used,
-                          "armed=%d\npid=%d\naddr=%llx\nrearm_addr=%llx\nrearm_mode=%u\nphase=%u\nlen=%u\nauto_disable_on_hit=%d\nauto_rearm_on_hit=%d\nevent_disabled=%d\nrearm_event_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nrearm_count=%llu\nrearm_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
+                          "armed=%d\npid=%d\naddr=%llx\nrearm_addr=%llx\nrearm_mode=%u\nphase=%u\nlen=%u\nlegacy_kernel=%d\nhandler_modify_supported=%d\nauto_disable_on_hit=%d\nauto_rearm_on_hit=%d\nevent_disabled=%d\nrearm_event_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nrearm_count=%llu\nrearm_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
                           g_record_state.armed,
                           g_record_state.pid,
                           (unsigned long long)g_record_state.addr,
@@ -2210,6 +2394,8 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                           g_record_state.rearm_mode,
                           g_record_state.phase,
                           g_record_state.len,
+                          amem_is_legacy_kernel(),
+                          amem_record_handler_modify_supported(),
                           g_record_state.auto_disable_on_hit,
                           g_record_state.auto_rearm_on_hit,
                           g_record_state.event_disabled,
