@@ -50,6 +50,7 @@ struct iovec {
 
 #define UIO_MAXIOV 1024
 #define AMEM_ACCESS_VM_WRITE_FLAG 1u
+#define AMEM_KMALLOC_GFP ((gfp_t)0)
 
 int kfunc_def(sprintf)(char *buf, const char *fmt, ...);
 unsigned long kfunc_def(_raw_spin_lock_irqsave)(raw_spinlock_t *lock);
@@ -1474,7 +1475,7 @@ static int copy_process_bytes_access_vm(struct task_struct *task,
     }
 
     if ((kf_kmalloc || kf___kmalloc) && kf_kfree) {
-        bounce = kmalloc(bounce_size, GFP_KERNEL);
+        bounce = kmalloc(bounce_size, AMEM_KMALLOC_GFP);
         if (bounce) {
             bounce_from_kmalloc = 1;
         }
