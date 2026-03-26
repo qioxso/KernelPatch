@@ -27,7 +27,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.12");
+KPM_VERSION("1.4.13");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -206,7 +206,7 @@ struct amem_record_event {
 };
 
 struct amem_record_state {
-    spinlock_t lock;
+    raw_spinlock_t lock;
     int armed;
     int auto_disable_on_hit;
     int auto_rearm_on_hit;
@@ -246,7 +246,7 @@ struct amem_so_trace_event {
 };
 
 struct amem_so_trace_state {
-    spinlock_t lock;
+    raw_spinlock_t lock;
     int armed;
     int running;
     pid_t pid;
@@ -302,6 +302,24 @@ static int amem_is_legacy_kernel(void)
 static int amem_record_handler_modify_supported(void)
 {
     return (g_modify_user_hw_breakpoint && !amem_is_legacy_kernel()) ? 1 : 0;
+}
+
+static inline unsigned long amem_raw_lock_irqsave(raw_spinlock_t *lock)
+{
+    return kf__raw_spin_lock_irqsave(lock);
+}
+
+static inline void amem_raw_unlock_irqrestore(raw_spinlock_t *lock, unsigned long flags)
+{
+    kf__raw_spin_unlock_irqrestore(lock, flags);
+}
+
+static inline void amem_raw_lock_init(raw_spinlock_t *lock)
+{
+    if (!lock) {
+        return;
+    }
+    memset(lock, 0, sizeof(*lock));
 }
 
 static inline uint64_t phys_to_virt_(uint64_t phys)
@@ -750,7 +768,6 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
                                            struct pt_regs *regs)
 {
     struct amem_record_event event;
-    struct stack_trace trace;
     u64 patch_values[AMEM_PATCH_SLOT_COUNT];
     u64 patch_mask = 0;
     u64 primary_addr = 0;
@@ -779,7 +796,7 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     event.bp_addr = g_record_state.addr;
     event.pid = g_record_state.pid;
     event.tid = task_pid_vnr(current);
-    flags = spin_lock_irqsave(&g_record_state.lock);
+    flags = amem_raw_lock_irqsave(&g_record_state.lock);
     patch_mask = g_record_state.patch_mask;
     primary_addr = g_record_state.addr;
     current_rearm_addr = g_record_state.rearm_addr;
@@ -792,7 +809,7 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     for (idx = 0; idx < AMEM_PATCH_SLOT_COUNT; ++idx) {
         patch_values[idx] = g_record_state.patch_values[idx];
     }
-    spin_unlock_irqrestore(&g_record_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_record_state.lock, flags);
     handler_can_modify = amem_record_handler_modify_supported();
 
     event.bp_addr = primary_addr;
@@ -848,17 +865,7 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
     event.rearm_rc = rearm_rc;
     event.rearm_enabled = rearm_enabled ? 1u : 0u;
 
-    if (rearm_mode != AMEM_RECORD_REARM_LINK && !amem_is_legacy_kernel()) {
-        memset(&trace, 0, sizeof(trace));
-        trace.nr_entries = 0;
-        trace.max_entries = AMEM_RECORD_STACK_DEPTH;
-        trace.entries = event.stack_entries;
-        trace.skip = 0;
-        save_stack_trace_tsk(current, &trace);
-        event.stack_nr = trace.nr_entries;
-    }
-
-    flags = spin_lock_irqsave(&g_record_state.lock);
+    flags = amem_raw_lock_irqsave(&g_record_state.lock);
     event.seq = ++g_record_state.hit_seq;
     if (auto_disabled) {
         g_record_state.armed = 0;
@@ -892,7 +899,7 @@ static void amem_record_breakpoint_handler(struct perf_event *bp,
         g_record_state.count++;
     }
     amem_record_copy_event(&g_record_state.events[slot], &event);
-    spin_unlock_irqrestore(&g_record_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_record_state.lock, flags);
 }
 
 static void amem_record_rearm_handler(struct perf_event *bp,
@@ -935,7 +942,7 @@ static void amem_record_rearm_handler(struct perf_event *bp,
         }
     }
 
-    flags = spin_lock_irqsave(&g_record_state.lock);
+    flags = amem_raw_lock_irqsave(&g_record_state.lock);
     if (rearm_disabled) {
         if (g_record_state.rearm_mode == AMEM_RECORD_REARM_LINK) {
             g_record_state.rearm_addr = 0;
@@ -951,7 +958,7 @@ static void amem_record_rearm_handler(struct perf_event *bp,
     } else {
         g_record_state.rearm_failures++;
     }
-    spin_unlock_irqrestore(&g_record_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_record_state.lock, flags);
 }
 
 static int amem_record_disarm(void)
@@ -960,7 +967,7 @@ static int amem_record_disarm(void)
     struct perf_event *rearm_event = NULL;
     unsigned long flags = 0;
 
-    flags = spin_lock_irqsave(&g_record_state.lock);
+    flags = amem_raw_lock_irqsave(&g_record_state.lock);
     event = g_record_state.event;
     rearm_event = g_record_state.rearm_event;
     g_record_state.event = NULL;
@@ -977,7 +984,7 @@ static int amem_record_disarm(void)
     g_record_state.type = 0;
     g_record_state.rearm_mode = AMEM_RECORD_REARM_NONE;
     g_record_state.phase = AMEM_RECORD_PHASE_PRIMARY;
-    spin_unlock_irqrestore(&g_record_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_record_state.lock, flags);
 
     if (event && g_unregister_hw_breakpoint) {
         g_unregister_hw_breakpoint(event);
@@ -1001,6 +1008,9 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
 
     if (!g_register_user_hw_breakpoint || !g_unregister_hw_breakpoint) {
         return -ENOSYS;
+    }
+    if (amem_is_legacy_kernel()) {
+        return -EOPNOTSUPP;
     }
     if (pid <= 0 || addr == 0) {
         return -EINVAL;
@@ -1045,7 +1055,7 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
         return rearm_event ? (int)PTR_ERR(rearm_event) : -EINVAL;
     }
 
-    flags = spin_lock_irqsave(&g_record_state.lock);
+    flags = amem_raw_lock_irqsave(&g_record_state.lock);
     g_record_state.event = event;
     g_record_state.rearm_event = rearm_event;
     g_record_state.armed = 1;
@@ -1066,7 +1076,7 @@ static int amem_record_arm_mode(pid_t pid, u64 addr, u32 len, u32 rearm_mode)
     g_record_state.rearm_count = 0;
     g_record_state.rearm_failures = 0;
     amem_record_clear_locked();
-    spin_unlock_irqrestore(&g_record_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_record_state.lock, flags);
 
     return rc;
 }
@@ -1109,7 +1119,7 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     }
 
     memset(patch_values, 0, sizeof(patch_values));
-    flags = spin_lock_irqsave(&g_record_state.lock);
+    flags = amem_raw_lock_irqsave(&g_record_state.lock);
     count = g_record_state.count;
     head = g_record_state.head;
     hit_seq = g_record_state.hit_seq;
@@ -1137,7 +1147,7 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
         amem_record_copy_event(&snapshot[i],
                                &g_record_state.events[(head + i) % AMEM_RECORD_EVENT_CAP]);
     }
-    spin_unlock_irqrestore(&g_record_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_record_state.lock, flags);
 
     used += scnprintf(buf + used, buf_size - used,
                       "armed=%d\npid=%d\naddr=%llx\nrearm_addr=%llx\nrearm_mode=%u\nphase=%u\nlen=%u\nauto_disable_on_hit=%d\nauto_rearm_on_hit=%d\nevent_disabled=%d\nrearm_event_disabled=%d\nauto_disable_count=%llu\nauto_disable_failures=%llu\nrearm_count=%llu\nrearm_failures=%llu\nhits=%llu\ndropped=%llu\ncount=%u\n",
@@ -1212,20 +1222,20 @@ static int amem_so_trace_step_handler(struct pt_regs *regs, unsigned int esr)
         return DBG_HOOK_ERROR;
     }
 
-    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    flags = amem_raw_lock_irqsave(&g_so_trace_state.lock);
     state = g_so_trace_state.state;
     pid = g_so_trace_state.pid;
     entry_addr = g_so_trace_state.entry_addr;
     module_base = g_so_trace_state.module_base;
     module_end = g_so_trace_state.module_end;
     step_limit = g_so_trace_state.step_limit;
-    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_so_trace_state.lock, flags);
 
     if (state != AMEM_SO_TRACE_STATE_RUNNING) {
         return DBG_HOOK_ERROR;
     }
     if (pid != tid) {
-        flags = spin_lock_irqsave(&g_so_trace_state.lock);
+        flags = amem_raw_lock_irqsave(&g_so_trace_state.lock);
         if (g_so_trace_state.state == AMEM_SO_TRACE_STATE_RUNNING &&
             g_so_trace_state.pid != tid) {
             g_so_trace_state.running = 0;
@@ -1233,7 +1243,7 @@ static int amem_so_trace_step_handler(struct pt_regs *regs, unsigned int esr)
             g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_ERROR;
             g_so_trace_state.last_rc = -ESRCH;
         }
-        spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+        amem_raw_unlock_irqrestore(&g_so_trace_state.lock, flags);
         regs->pstate &= ~DBG_SPSR_SS;
         if (g_user_disable_single_step) {
             g_user_disable_single_step(current);
@@ -1251,7 +1261,7 @@ static int amem_so_trace_step_handler(struct pt_regs *regs, unsigned int esr)
         stop_reason = AMEM_SO_TRACE_STOP_MODULE_EXIT;
     }
 
-    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    flags = amem_raw_lock_irqsave(&g_so_trace_state.lock);
     event.seq = ++g_so_trace_state.event_seq;
     amem_so_trace_append_event_locked(&event);
     if (stop_reason == AMEM_SO_TRACE_STOP_NONE &&
@@ -1265,7 +1275,7 @@ static int amem_so_trace_step_handler(struct pt_regs *regs, unsigned int esr)
         g_so_trace_state.last_rc = 0;
         stop_now = 1;
     }
-    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_so_trace_state.lock, flags);
 
     if (stop_now) {
         regs->pstate &= ~DBG_SPSR_SS;
@@ -1287,20 +1297,18 @@ static void amem_so_trace_breakpoint_handler(struct perf_event *bp,
     unsigned long flags = 0;
     pid_t tid = task_pid_vnr(current);
     u64 entry_addr = 0;
-    u32 len = 0;
     u32 step_limit = 0;
-    int disable_rc = -ENOSYS;
     int start_step = 0;
 
+    (void)bp;
     (void)data;
 
     memset(&event, 0, sizeof(event));
 
-    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    flags = amem_raw_lock_irqsave(&g_so_trace_state.lock);
     entry_addr = g_so_trace_state.entry_addr;
-    len = g_so_trace_state.len;
     step_limit = g_so_trace_state.step_limit;
-    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_so_trace_state.lock, flags);
 
     event.pid = tid;
     event.tid = tid;
@@ -1309,21 +1317,17 @@ static void amem_so_trace_breakpoint_handler(struct perf_event *bp,
         amem_so_trace_capture_regs(&event, regs);
     }
 
-    if (bp) {
-        disable_rc = amem_record_modify_event(bp, entry_addr, len, HW_BREAKPOINT_X, 1);
-    }
-
-    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    flags = amem_raw_lock_irqsave(&g_so_trace_state.lock);
     g_so_trace_state.pid = tid;
     event.seq = ++g_so_trace_state.event_seq;
     amem_so_trace_append_event_locked(&event);
     g_so_trace_state.hit_count++;
     g_so_trace_state.armed = 0;
-    if (disable_rc < 0 || !regs) {
+    if (!regs) {
         g_so_trace_state.running = 0;
         g_so_trace_state.state = AMEM_SO_TRACE_STATE_FAILED;
         g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_ERROR;
-        g_so_trace_state.last_rc = disable_rc < 0 ? disable_rc : -EINVAL;
+        g_so_trace_state.last_rc = -EINVAL;
     } else if (g_so_trace_state.count >= step_limit) {
         g_so_trace_state.running = 0;
         g_so_trace_state.state = AMEM_SO_TRACE_STATE_DONE;
@@ -1336,7 +1340,7 @@ static void amem_so_trace_breakpoint_handler(struct perf_event *bp,
         g_so_trace_state.last_rc = 0;
         start_step = 1;
     }
-    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_so_trace_state.lock, flags);
 
     if (!regs) {
         return;
@@ -1363,7 +1367,7 @@ static int amem_so_trace_disarm(void)
     int need_disable_step = 0;
     int unregister_rc = 0;
 
-    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    flags = amem_raw_lock_irqsave(&g_so_trace_state.lock);
     event = g_so_trace_state.event;
     pid = g_so_trace_state.pid;
     need_disable_step = g_so_trace_state.running;
@@ -1379,7 +1383,7 @@ static int amem_so_trace_disarm(void)
     }
     g_so_trace_state.armed = 0;
     g_so_trace_state.running = 0;
-    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_so_trace_state.lock, flags);
 
     if (event && g_unregister_hw_breakpoint) {
         g_unregister_hw_breakpoint(event);
@@ -1461,7 +1465,7 @@ static int amem_so_trace_arm(pid_t pid, u64 entry_addr,
         return event ? (int)PTR_ERR(event) : -EINVAL;
     }
 
-    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    flags = amem_raw_lock_irqsave(&g_so_trace_state.lock);
     g_so_trace_state.event = event;
     g_so_trace_state.armed = 1;
     g_so_trace_state.running = 0;
@@ -1475,7 +1479,7 @@ static int amem_so_trace_arm(pid_t pid, u64 entry_addr,
     g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_NONE;
     g_so_trace_state.last_rc = 0;
     amem_so_trace_clear_locked();
-    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_so_trace_state.lock, flags);
 
     return 0;
 }
@@ -1506,7 +1510,7 @@ static size_t amem_so_trace_dump(char *buf, size_t buf_size, int include_events)
         return 0;
     }
 
-    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    flags = amem_raw_lock_irqsave(&g_so_trace_state.lock);
     armed = g_so_trace_state.armed;
     running = g_so_trace_state.running;
     pid = g_so_trace_state.pid;
@@ -1526,7 +1530,7 @@ static size_t amem_so_trace_dump(char *buf, size_t buf_size, int include_events)
         amem_so_trace_copy_event(&snapshot[i],
                                  &g_so_trace_state.events[(head + i) % AMEM_SO_TRACE_EVENT_CAP]);
     }
-    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+    amem_raw_unlock_irqrestore(&g_so_trace_state.lock, flags);
 
     used += scnprintf(buf + used, buf_size - used,
                       "armed=%d\nrunning=%d\nstate=%u\nstate_text=%s\nstop_reason=%u\nstop_reason_text=%s\npid=%d\nentry_addr=%llx\nmodule_base=%llx\nmodule_end=%llx\nlen=%u\nstep_limit=%u\nhits=%llu\ndropped=%llu\ncount=%u\nlast_rc=%d\n",
@@ -1934,8 +1938,8 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
 
     pr_info("amem-kpm init: event=%s\n", event ? event : "(null)");
 
-    spin_lock_init(&g_record_state.lock);
-    spin_lock_init(&g_so_trace_state.lock);
+    amem_raw_lock_init(&g_record_state.lock);
+    amem_raw_lock_init(&g_so_trace_state.lock);
     kfunc_match(sprintf, NULL, 0);
     kfunc_match(_raw_spin_lock_irqsave, NULL, 0);
     kfunc_match(_raw_spin_unlock_irqrestore, NULL, 0);
@@ -2175,8 +2179,12 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
             used = append_line(buf, sizeof(buf), used, "mode.record_only.stack_snapshot=task_stack_top8");
         }
         used = append_line(buf, sizeof(buf), used, "mode.record_only.trace=event_ring_dump");
-        used = append_line(buf, sizeof(buf), used, "mode.record_only.arm_cmd=record-arm <tid_or_pid> <addr> [len]");
-        if (amem_record_handler_modify_supported()) {
+        if (amem_is_legacy_kernel()) {
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.arm_cmd=record-arm (unsupported_on_legacy_kernel)");
+        } else {
+            used = append_line(buf, sizeof(buf), used, "mode.record_only.arm_cmd=record-arm <tid_or_pid> <addr> [len]");
+        }
+        if (amem_record_handler_modify_supported() && !amem_is_legacy_kernel()) {
             used = append_line(buf, sizeof(buf), used, "mode.record_only.loop_cmd=record-arm-loop <tid_or_pid> <addr> [len]");
             used = append_line(buf, sizeof(buf), used, "mode.record_only.ret_loop_cmd=record-arm-ret-loop <tid_or_pid> <ret_addr> [len]");
         } else {
@@ -2259,7 +2267,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         if (rc < 0) {
             if (rc == -EOPNOTSUPP) {
                 scnprintf(buf, sizeof(buf),
-                          "record-arm-loop failed rc=%d unsupported_on_kernel_lt_5_4",
+                          "record-arm-loop failed rc=%d unsupported_on_legacy_kernel",
                           rc);
             } else {
                 scnprintf(buf, sizeof(buf), "record-arm-loop failed rc=%d", rc);
@@ -2287,7 +2295,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         if (rc < 0) {
             if (rc == -EOPNOTSUPP) {
                 scnprintf(buf, sizeof(buf),
-                          "record-arm-ret-loop failed rc=%d unsupported_on_kernel_lt_5_4",
+                          "record-arm-ret-loop failed rc=%d unsupported_on_legacy_kernel",
                           rc);
             } else {
                 scnprintf(buf, sizeof(buf), "record-arm-ret-loop failed rc=%d", rc);
@@ -2314,7 +2322,13 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
 
         rc = amem_record_arm((pid_t)pid, (u64)addr, len);
         if (rc < 0) {
-            scnprintf(buf, sizeof(buf), "record-arm failed rc=%d", rc);
+            if (rc == -EOPNOTSUPP) {
+                scnprintf(buf, sizeof(buf),
+                          "record-arm failed rc=%d unsupported_on_legacy_kernel",
+                          rc);
+            } else {
+                scnprintf(buf, sizeof(buf), "record-arm failed rc=%d", rc);
+            }
             return write_text_response(out_msg, outlen, buf);
         }
         if (amem_record_handler_modify_supported()) {
@@ -2348,10 +2362,10 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                                        "record-patch-set failed: unsupported reg");
         }
 
-        flags = spin_lock_irqsave(&g_record_state.lock);
+        flags = amem_raw_lock_irqsave(&g_record_state.lock);
         g_record_state.patch_mask |= AMEM_PATCH_BIT((u32)slot);
         g_record_state.patch_values[slot] = (u64)value;
-        spin_unlock_irqrestore(&g_record_state.lock, flags);
+        amem_raw_unlock_irqrestore(&g_record_state.lock, flags);
         scnprintf(buf, sizeof(buf), "record-patch-set ok reg=%s value=%llx",
                   reg, (unsigned long long)((u64)value));
         return write_text_response(out_msg, outlen, buf);
@@ -2359,9 +2373,9 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
 
     if (!strcmp(args, "record-patch-clear")) {
         unsigned long flags = 0;
-        flags = spin_lock_irqsave(&g_record_state.lock);
+        flags = amem_raw_lock_irqsave(&g_record_state.lock);
         amem_record_patch_clear_locked();
-        spin_unlock_irqrestore(&g_record_state.lock, flags);
+        amem_raw_unlock_irqrestore(&g_record_state.lock, flags);
         return write_text_response(out_msg, outlen, "record-patch-clear ok");
     }
 
@@ -2376,9 +2390,9 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
 
     if (!strcmp(args, "record-clear")) {
         unsigned long flags = 0;
-        flags = spin_lock_irqsave(&g_record_state.lock);
+        flags = amem_raw_lock_irqsave(&g_record_state.lock);
         amem_record_clear_locked();
-        spin_unlock_irqrestore(&g_record_state.lock, flags);
+        amem_raw_unlock_irqrestore(&g_record_state.lock, flags);
         return write_text_response(out_msg, outlen, "record-clear ok");
     }
 
@@ -2466,16 +2480,16 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
     if (!strcmp(args, "trace-so-clear")) {
         unsigned long flags = 0;
 
-        flags = spin_lock_irqsave(&g_so_trace_state.lock);
+        flags = amem_raw_lock_irqsave(&g_so_trace_state.lock);
         if (g_so_trace_state.armed || g_so_trace_state.running) {
-            spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+            amem_raw_unlock_irqrestore(&g_so_trace_state.lock, flags);
             return write_text_response(out_msg, outlen, "trace-so-clear failed rc=-16");
         }
         g_so_trace_state.state = AMEM_SO_TRACE_STATE_IDLE;
         g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_NONE;
         g_so_trace_state.last_rc = 0;
         amem_so_trace_clear_locked();
-        spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+        amem_raw_unlock_irqrestore(&g_so_trace_state.lock, flags);
         return write_text_response(out_msg, outlen, "trace-so-clear ok");
     }
 
