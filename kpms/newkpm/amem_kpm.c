@@ -27,7 +27,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.10");
+KPM_VERSION("1.4.11");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -274,6 +274,17 @@ static int amem_so_trace_step_handler(struct pt_regs *regs, unsigned int esr);
 static struct step_hook_local g_so_trace_step_hook = {
     .fn = amem_so_trace_step_handler,
 };
+
+static int amem_so_trace_supported(void)
+{
+    return (kver >= VERSION(5, 4, 0) &&
+            g_register_user_hw_breakpoint &&
+            g_unregister_hw_breakpoint &&
+            g_user_enable_single_step &&
+            g_user_disable_single_step &&
+            g_register_step_hook &&
+            g_unregister_step_hook) ? 1 : 0;
+}
 
 static inline uint64_t phys_to_virt_(uint64_t phys)
 {
@@ -1165,8 +1176,24 @@ static int amem_so_trace_step_handler(struct pt_regs *regs, unsigned int esr)
     step_limit = g_so_trace_state.step_limit;
     spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
 
-    if (state != AMEM_SO_TRACE_STATE_RUNNING || pid != tid) {
+    if (state != AMEM_SO_TRACE_STATE_RUNNING) {
         return DBG_HOOK_ERROR;
+    }
+    if (pid != tid) {
+        flags = spin_lock_irqsave(&g_so_trace_state.lock);
+        if (g_so_trace_state.state == AMEM_SO_TRACE_STATE_RUNNING &&
+            g_so_trace_state.pid != tid) {
+            g_so_trace_state.running = 0;
+            g_so_trace_state.state = AMEM_SO_TRACE_STATE_FAILED;
+            g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_ERROR;
+            g_so_trace_state.last_rc = -ESRCH;
+        }
+        spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+        regs->pstate &= ~DBG_SPSR_SS;
+        if (g_user_disable_single_step) {
+            g_user_disable_single_step(current);
+        }
+        return DBG_HOOK_HANDLED;
     }
 
     memset(&event, 0, sizeof(event));
@@ -1213,7 +1240,6 @@ static void amem_so_trace_breakpoint_handler(struct perf_event *bp,
 {
     struct amem_so_trace_event event;
     unsigned long flags = 0;
-    pid_t pid = 0;
     pid_t tid = task_pid_vnr(current);
     u64 entry_addr = 0;
     u32 len = 0;
@@ -1226,13 +1252,12 @@ static void amem_so_trace_breakpoint_handler(struct perf_event *bp,
     memset(&event, 0, sizeof(event));
 
     flags = spin_lock_irqsave(&g_so_trace_state.lock);
-    pid = g_so_trace_state.pid;
     entry_addr = g_so_trace_state.entry_addr;
     len = g_so_trace_state.len;
     step_limit = g_so_trace_state.step_limit;
     spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
 
-    event.pid = pid;
+    event.pid = tid;
     event.tid = tid;
     event.bp_addr = entry_addr;
     if (regs) {
@@ -1244,6 +1269,7 @@ static void amem_so_trace_breakpoint_handler(struct perf_event *bp,
     }
 
     flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    g_so_trace_state.pid = tid;
     event.seq = ++g_so_trace_state.event_seq;
     amem_so_trace_append_event_locked(&event);
     g_so_trace_state.hit_count++;
@@ -1343,12 +1369,11 @@ static int amem_so_trace_arm(pid_t pid, u64 entry_addr,
     unsigned long flags = 0;
     int rc = 0;
 
-    if (!g_register_user_hw_breakpoint || !g_unregister_hw_breakpoint ||
-        !g_user_enable_single_step || !g_user_disable_single_step) {
-        return -ENOSYS;
-    }
     if (kver < VERSION(5, 4, 0)) {
         return -EOPNOTSUPP;
+    }
+    if (!amem_so_trace_supported()) {
+        return -ENOSYS;
     }
     if (pid <= 0 || entry_addr == 0 || module_base == 0 ||
         module_end <= module_base) {
@@ -1803,14 +1828,21 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
         kallsyms_lookup_name("modify_user_hw_breakpoint");
     g_unregister_hw_breakpoint = (unregister_hw_breakpoint_fn)(uintptr_t)
         kallsyms_lookup_name("unregister_hw_breakpoint");
-    g_user_enable_single_step = (user_single_step_fn)(uintptr_t)
-        kallsyms_lookup_name("user_enable_single_step");
-    g_user_disable_single_step = (user_single_step_fn)(uintptr_t)
-        kallsyms_lookup_name("user_disable_single_step");
-    g_register_step_hook = (register_step_hook_fn)(uintptr_t)
-        kallsyms_lookup_name("register_user_step_hook");
-    g_unregister_step_hook = (unregister_step_hook_fn)(uintptr_t)
-        kallsyms_lookup_name("unregister_user_step_hook");
+    if (kver >= VERSION(5, 4, 0)) {
+        g_user_enable_single_step = (user_single_step_fn)(uintptr_t)
+            kallsyms_lookup_name("user_enable_single_step");
+        g_user_disable_single_step = (user_single_step_fn)(uintptr_t)
+            kallsyms_lookup_name("user_disable_single_step");
+        g_register_step_hook = (register_step_hook_fn)(uintptr_t)
+            kallsyms_lookup_name("register_user_step_hook");
+        g_unregister_step_hook = (unregister_step_hook_fn)(uintptr_t)
+            kallsyms_lookup_name("unregister_user_step_hook");
+    } else {
+        g_user_enable_single_step = NULL;
+        g_user_disable_single_step = NULL;
+        g_register_step_hook = NULL;
+        g_unregister_step_hook = NULL;
+    }
 
     if (!kf__raw_spin_lock_irqsave || !kf__raw_spin_unlock_irqrestore ||
         !kf___rcu_read_lock || !kf___rcu_read_unlock ||
@@ -1899,10 +1931,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 write_hook_installed,
                 (unsigned long long)read_count,
                 (unsigned long long)write_count,
-                (kver >= VERSION(5, 4, 0) &&
-                 g_register_user_hw_breakpoint && g_unregister_hw_breakpoint &&
-                 g_user_enable_single_step && g_user_disable_single_step &&
-                 g_register_step_hook && g_unregister_step_hook) ? 1 : 0,
+                amem_so_trace_supported(),
                 g_so_trace_state.armed,
                 g_so_trace_state.running,
                 g_so_trace_state.state,
