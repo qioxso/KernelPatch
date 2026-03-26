@@ -27,7 +27,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.8");
+KPM_VERSION("1.4.9");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -1787,16 +1787,8 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
         kallsyms_lookup_name("user_disable_single_step");
     g_register_step_hook = (register_step_hook_fn)(uintptr_t)
         kallsyms_lookup_name("register_user_step_hook");
-    if (!g_register_step_hook) {
-        g_register_step_hook = (register_step_hook_fn)(uintptr_t)
-            kallsyms_lookup_name("register_step_hook");
-    }
     g_unregister_step_hook = (unregister_step_hook_fn)(uintptr_t)
         kallsyms_lookup_name("unregister_user_step_hook");
-    if (!g_unregister_step_hook) {
-        g_unregister_step_hook = (unregister_step_hook_fn)(uintptr_t)
-            kallsyms_lookup_name("unregister_step_hook");
-    }
     if (g_register_step_hook && g_unregister_step_hook) {
         g_register_step_hook(&g_so_trace_step_hook);
         g_step_hook_registered = 1;
