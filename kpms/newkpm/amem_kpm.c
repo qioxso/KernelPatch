@@ -14,6 +14,7 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/rcupdate.h>
+#include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/stacktrace.h>
 #include <linux/string.h>
@@ -26,7 +27,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.7");
+KPM_VERSION("1.4.8");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -84,6 +85,31 @@ static uint64_t page_size_ = 4096;
 #define AMEM_RECORD_REARM_LINK   2u
 #define AMEM_RECORD_PHASE_PRIMARY 0u
 #define AMEM_RECORD_PHASE_REARM   1u
+#define AMEM_SO_TRACE_EVENT_CAP 16
+#define AMEM_SO_TRACE_DEFAULT_STEP_LIMIT 12u
+#define AMEM_SO_TRACE_MAX_STEP_LIMIT AMEM_SO_TRACE_EVENT_CAP
+#define AMEM_SO_TRACE_STATE_IDLE     0u
+#define AMEM_SO_TRACE_STATE_ARMED    1u
+#define AMEM_SO_TRACE_STATE_RUNNING  2u
+#define AMEM_SO_TRACE_STATE_DONE     3u
+#define AMEM_SO_TRACE_STATE_FAILED   4u
+#define AMEM_SO_TRACE_STOP_NONE        0u
+#define AMEM_SO_TRACE_STOP_MANUAL      1u
+#define AMEM_SO_TRACE_STOP_MODULE_EXIT 2u
+#define AMEM_SO_TRACE_STOP_STEP_LIMIT  3u
+#define AMEM_SO_TRACE_STOP_ERROR       4u
+
+#ifndef DBG_SPSR_SS
+#define DBG_SPSR_SS (1UL << 21)
+#endif
+
+#ifndef DBG_HOOK_HANDLED
+#define DBG_HOOK_HANDLED 0
+#endif
+
+#ifndef DBG_HOOK_ERROR
+#define DBG_HOOK_ERROR 1
+#endif
 
 #define AMEM_PATCH_SLOT_SP     31u
 #define AMEM_PATCH_SLOT_PC     32u
@@ -108,6 +134,11 @@ struct perf_sample_data;
 typedef void (*perf_overflow_handler_t)(struct perf_event *bp,
                                         struct perf_sample_data *data,
                                         struct pt_regs *regs);
+
+struct step_hook_local {
+    struct list_head node;
+    int (*fn)(struct pt_regs *regs, unsigned int esr);
+};
 
 struct perf_event_attr_local {
     u32 type;
@@ -144,6 +175,9 @@ typedef int (*modify_user_hw_breakpoint_fn)(
     struct perf_event *bp,
     struct perf_event_attr_local *attr);
 typedef void (*unregister_hw_breakpoint_fn)(struct perf_event *bp);
+typedef void (*user_single_step_fn)(struct task_struct *task);
+typedef void (*register_step_hook_fn)(struct step_hook_local *hook);
+typedef void (*unregister_step_hook_fn)(struct step_hook_local *hook);
 
 struct amem_record_event {
     u64 seq;
@@ -193,10 +227,53 @@ struct amem_record_state {
     struct amem_record_event events[AMEM_RECORD_EVENT_CAP];
 };
 
+struct amem_so_trace_event {
+    u64 seq;
+    pid_t pid;
+    pid_t tid;
+    u64 bp_addr;
+    u64 pc;
+    u64 sp;
+    u64 pstate;
+    u64 regs[31];
+};
+
+struct amem_so_trace_state {
+    spinlock_t lock;
+    int armed;
+    int running;
+    pid_t pid;
+    u64 entry_addr;
+    u64 module_base;
+    u64 module_end;
+    u32 len;
+    u32 step_limit;
+    u32 state;
+    u32 stop_reason;
+    s32 last_rc;
+    u64 hit_count;
+    u64 dropped;
+    u64 event_seq;
+    u32 head;
+    u32 count;
+    struct perf_event *event;
+    struct amem_so_trace_event events[AMEM_SO_TRACE_EVENT_CAP];
+};
+
 static register_user_hw_breakpoint_fn g_register_user_hw_breakpoint = NULL;
 static modify_user_hw_breakpoint_fn g_modify_user_hw_breakpoint = NULL;
 static unregister_hw_breakpoint_fn g_unregister_hw_breakpoint = NULL;
+static user_single_step_fn g_user_enable_single_step = NULL;
+static user_single_step_fn g_user_disable_single_step = NULL;
+static register_step_hook_fn g_register_step_hook = NULL;
+static unregister_step_hook_fn g_unregister_step_hook = NULL;
+static int g_step_hook_registered = 0;
 static struct amem_record_state g_record_state;
+static struct amem_so_trace_state g_so_trace_state;
+static int amem_so_trace_step_handler(struct pt_regs *regs, unsigned int esr);
+static struct step_hook_local g_so_trace_step_hook = {
+    .fn = amem_so_trace_step_handler,
+};
 
 static inline uint64_t phys_to_virt_(uint64_t phys)
 {
@@ -312,6 +389,124 @@ static int amem_record_modify_event(struct perf_event *event,
 
     amem_record_fill_attr(&attr, addr, len, type, disabled);
     return g_modify_user_hw_breakpoint(event, &attr);
+}
+
+static const char *amem_so_trace_state_name(u32 state)
+{
+    switch (state) {
+    case AMEM_SO_TRACE_STATE_IDLE:
+        return "idle";
+    case AMEM_SO_TRACE_STATE_ARMED:
+        return "armed";
+    case AMEM_SO_TRACE_STATE_RUNNING:
+        return "running";
+    case AMEM_SO_TRACE_STATE_DONE:
+        return "done";
+    case AMEM_SO_TRACE_STATE_FAILED:
+        return "failed";
+    default:
+        return "unknown";
+    }
+}
+
+static const char *amem_so_trace_stop_reason_name(u32 reason)
+{
+    switch (reason) {
+    case AMEM_SO_TRACE_STOP_NONE:
+        return "none";
+    case AMEM_SO_TRACE_STOP_MANUAL:
+        return "manual";
+    case AMEM_SO_TRACE_STOP_MODULE_EXIT:
+        return "module_exit";
+    case AMEM_SO_TRACE_STOP_STEP_LIMIT:
+        return "step_limit";
+    case AMEM_SO_TRACE_STOP_ERROR:
+        return "error";
+    default:
+        return "unknown";
+    }
+}
+
+static void amem_so_trace_clear_locked(void)
+{
+    g_so_trace_state.hit_count = 0;
+    g_so_trace_state.dropped = 0;
+    g_so_trace_state.event_seq = 0;
+    g_so_trace_state.head = 0;
+    g_so_trace_state.count = 0;
+    g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_NONE;
+    g_so_trace_state.last_rc = 0;
+    memset(g_so_trace_state.events, 0, sizeof(g_so_trace_state.events));
+}
+
+static void amem_so_trace_copy_event(struct amem_so_trace_event *dst,
+                                     const struct amem_so_trace_event *src)
+{
+    u32 idx = 0;
+
+    if (!dst || !src) {
+        return;
+    }
+
+    dst->seq = src->seq;
+    dst->pid = src->pid;
+    dst->tid = src->tid;
+    dst->bp_addr = src->bp_addr;
+    dst->pc = src->pc;
+    dst->sp = src->sp;
+    dst->pstate = src->pstate;
+    for (idx = 0; idx < 31; ++idx) {
+        dst->regs[idx] = src->regs[idx];
+    }
+}
+
+static void amem_so_trace_capture_regs(struct amem_so_trace_event *event,
+                                       const struct pt_regs *regs)
+{
+    u32 idx = 0;
+
+    if (!event || !regs) {
+        return;
+    }
+
+    event->pc = regs->pc;
+    event->sp = regs->sp;
+    event->pstate = regs->pstate;
+    for (idx = 0; idx < 31; ++idx) {
+        event->regs[idx] = regs->regs[idx];
+    }
+}
+
+static void amem_so_trace_append_event_locked(const struct amem_so_trace_event *event)
+{
+    u32 slot = 0;
+
+    if (!event) {
+        return;
+    }
+
+    slot = (g_so_trace_state.head + g_so_trace_state.count) % AMEM_SO_TRACE_EVENT_CAP;
+    if (g_so_trace_state.count == AMEM_SO_TRACE_EVENT_CAP) {
+        slot = g_so_trace_state.head;
+        g_so_trace_state.head = (g_so_trace_state.head + 1) % AMEM_SO_TRACE_EVENT_CAP;
+        g_so_trace_state.dropped++;
+    } else {
+        g_so_trace_state.count++;
+    }
+    amem_so_trace_copy_event(&g_so_trace_state.events[slot], event);
+}
+
+static int amem_so_trace_register_step_hook(void)
+{
+    if (g_step_hook_registered) {
+        return 0;
+    }
+    if (!g_register_step_hook || !g_unregister_step_hook) {
+        return -ENOSYS;
+    }
+    g_register_step_hook(&g_so_trace_step_hook);
+    g_step_hook_registered = 1;
+    return 0;
 }
 
 static void amem_record_clear_locked(void)
@@ -928,6 +1123,373 @@ static size_t amem_record_dump(char *buf, size_t buf_size)
     return used;
 }
 
+static int amem_so_trace_step_handler(struct pt_regs *regs, unsigned int esr)
+{
+    struct amem_so_trace_event event;
+    unsigned long flags = 0;
+    u64 entry_addr = 0;
+    u64 module_base = 0;
+    u64 module_end = 0;
+    pid_t pid = 0;
+    pid_t tid = task_pid_vnr(current);
+    u32 step_limit = 0;
+    u32 state = AMEM_SO_TRACE_STATE_IDLE;
+    u32 stop_reason = AMEM_SO_TRACE_STOP_NONE;
+    int stop_now = 0;
+
+    (void)esr;
+
+    if (!regs) {
+        return DBG_HOOK_ERROR;
+    }
+
+    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    state = g_so_trace_state.state;
+    pid = g_so_trace_state.pid;
+    entry_addr = g_so_trace_state.entry_addr;
+    module_base = g_so_trace_state.module_base;
+    module_end = g_so_trace_state.module_end;
+    step_limit = g_so_trace_state.step_limit;
+    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+
+    if (state != AMEM_SO_TRACE_STATE_RUNNING || pid != tid) {
+        return DBG_HOOK_ERROR;
+    }
+
+    memset(&event, 0, sizeof(event));
+    event.pid = pid;
+    event.tid = tid;
+    event.bp_addr = entry_addr;
+    amem_so_trace_capture_regs(&event, regs);
+
+    if (event.pc < module_base || event.pc >= module_end) {
+        stop_reason = AMEM_SO_TRACE_STOP_MODULE_EXIT;
+    }
+
+    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    event.seq = ++g_so_trace_state.event_seq;
+    amem_so_trace_append_event_locked(&event);
+    if (stop_reason == AMEM_SO_TRACE_STOP_NONE &&
+        g_so_trace_state.count >= step_limit) {
+        stop_reason = AMEM_SO_TRACE_STOP_STEP_LIMIT;
+    }
+    if (stop_reason != AMEM_SO_TRACE_STOP_NONE) {
+        g_so_trace_state.running = 0;
+        g_so_trace_state.state = AMEM_SO_TRACE_STATE_DONE;
+        g_so_trace_state.stop_reason = stop_reason;
+        g_so_trace_state.last_rc = 0;
+        stop_now = 1;
+    }
+    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+
+    if (stop_now) {
+        regs->pstate &= ~DBG_SPSR_SS;
+        if (g_user_disable_single_step) {
+            g_user_disable_single_step(current);
+        }
+    } else {
+        regs->pstate |= DBG_SPSR_SS;
+    }
+
+    return DBG_HOOK_HANDLED;
+}
+
+static void amem_so_trace_breakpoint_handler(struct perf_event *bp,
+                                             struct perf_sample_data *data,
+                                             struct pt_regs *regs)
+{
+    struct amem_so_trace_event event;
+    unsigned long flags = 0;
+    pid_t pid = 0;
+    pid_t tid = task_pid_vnr(current);
+    u64 entry_addr = 0;
+    u32 len = 0;
+    u32 step_limit = 0;
+    int disable_rc = -ENOSYS;
+    int start_step = 0;
+
+    (void)data;
+
+    memset(&event, 0, sizeof(event));
+
+    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    pid = g_so_trace_state.pid;
+    entry_addr = g_so_trace_state.entry_addr;
+    len = g_so_trace_state.len;
+    step_limit = g_so_trace_state.step_limit;
+    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+
+    event.pid = pid;
+    event.tid = tid;
+    event.bp_addr = entry_addr;
+    if (regs) {
+        amem_so_trace_capture_regs(&event, regs);
+    }
+
+    if (bp) {
+        disable_rc = amem_record_modify_event(bp, entry_addr, len, HW_BREAKPOINT_X, 1);
+    }
+
+    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    event.seq = ++g_so_trace_state.event_seq;
+    amem_so_trace_append_event_locked(&event);
+    g_so_trace_state.hit_count++;
+    g_so_trace_state.armed = 0;
+    if (disable_rc < 0 || !regs) {
+        g_so_trace_state.running = 0;
+        g_so_trace_state.state = AMEM_SO_TRACE_STATE_FAILED;
+        g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_ERROR;
+        g_so_trace_state.last_rc = disable_rc < 0 ? disable_rc : -EINVAL;
+    } else if (g_so_trace_state.count >= step_limit) {
+        g_so_trace_state.running = 0;
+        g_so_trace_state.state = AMEM_SO_TRACE_STATE_DONE;
+        g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_STEP_LIMIT;
+        g_so_trace_state.last_rc = 0;
+    } else {
+        g_so_trace_state.running = 1;
+        g_so_trace_state.state = AMEM_SO_TRACE_STATE_RUNNING;
+        g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_NONE;
+        g_so_trace_state.last_rc = 0;
+        start_step = 1;
+    }
+    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+
+    if (!regs) {
+        return;
+    }
+
+    if (start_step) {
+        regs->pstate |= DBG_SPSR_SS;
+        if (g_user_enable_single_step) {
+            g_user_enable_single_step(current);
+        }
+    } else {
+        regs->pstate &= ~DBG_SPSR_SS;
+        if (g_user_disable_single_step) {
+            g_user_disable_single_step(current);
+        }
+    }
+}
+
+static int amem_so_trace_disarm(void)
+{
+    struct perf_event *event = NULL;
+    unsigned long flags = 0;
+    pid_t pid = 0;
+    int need_disable_step = 0;
+
+    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    event = g_so_trace_state.event;
+    pid = g_so_trace_state.pid;
+    need_disable_step = g_so_trace_state.running;
+    g_so_trace_state.event = NULL;
+    if ((g_so_trace_state.armed || g_so_trace_state.running) &&
+        g_so_trace_state.state != AMEM_SO_TRACE_STATE_DONE &&
+        g_so_trace_state.state != AMEM_SO_TRACE_STATE_FAILED) {
+        g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_MANUAL;
+        g_so_trace_state.state = g_so_trace_state.hit_count
+            ? AMEM_SO_TRACE_STATE_DONE
+            : AMEM_SO_TRACE_STATE_IDLE;
+        g_so_trace_state.last_rc = 0;
+    }
+    g_so_trace_state.armed = 0;
+    g_so_trace_state.running = 0;
+    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+
+    if (event && g_unregister_hw_breakpoint) {
+        g_unregister_hw_breakpoint(event);
+    }
+
+    if (need_disable_step && g_user_disable_single_step && pid > 0) {
+        struct task_struct *task = NULL;
+
+        rcu_read_lock();
+        task = find_task_by_vpid(pid);
+        if (task) {
+            g_user_disable_single_step(task);
+        }
+        rcu_read_unlock();
+    }
+
+    return 0;
+}
+
+static int amem_so_trace_arm(pid_t pid, u64 entry_addr,
+                             u64 module_base, u64 module_end,
+                             u32 step_limit, u32 len)
+{
+    struct perf_event_attr_local attr;
+    struct task_struct *task = NULL;
+    struct perf_event *event = NULL;
+    unsigned long flags = 0;
+    int rc = 0;
+
+    if (!g_register_user_hw_breakpoint || !g_unregister_hw_breakpoint ||
+        !g_user_enable_single_step || !g_user_disable_single_step) {
+        return -ENOSYS;
+    }
+    if (pid <= 0 || entry_addr == 0 || module_base == 0 ||
+        module_end <= module_base) {
+        return -EINVAL;
+    }
+    if (entry_addr < module_base || entry_addr >= module_end) {
+        return -EINVAL;
+    }
+    if (len != 1 && len != 2 && len != 4 && len != 8) {
+        return -EINVAL;
+    }
+    if (step_limit == 0) {
+        step_limit = AMEM_SO_TRACE_DEFAULT_STEP_LIMIT;
+    }
+    if (step_limit > AMEM_SO_TRACE_MAX_STEP_LIMIT) {
+        return -EINVAL;
+    }
+
+    rc = amem_so_trace_register_step_hook();
+    if (rc < 0) {
+        return rc;
+    }
+
+    rc = amem_so_trace_disarm();
+    if (rc < 0) {
+        return rc;
+    }
+
+    amem_record_fill_attr(&attr, entry_addr, len, HW_BREAKPOINT_X, 0);
+
+    rcu_read_lock();
+    task = find_task_by_vpid(pid);
+    if (!task) {
+        rcu_read_unlock();
+        return -ESRCH;
+    }
+    event = g_register_user_hw_breakpoint(&attr, amem_so_trace_breakpoint_handler, NULL, task);
+    rcu_read_unlock();
+    if (IS_ERR_OR_NULL(event)) {
+        return event ? (int)PTR_ERR(event) : -EINVAL;
+    }
+
+    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    g_so_trace_state.event = event;
+    g_so_trace_state.armed = 1;
+    g_so_trace_state.running = 0;
+    g_so_trace_state.pid = pid;
+    g_so_trace_state.entry_addr = entry_addr;
+    g_so_trace_state.module_base = module_base;
+    g_so_trace_state.module_end = module_end;
+    g_so_trace_state.len = len;
+    g_so_trace_state.step_limit = step_limit;
+    g_so_trace_state.state = AMEM_SO_TRACE_STATE_ARMED;
+    g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_NONE;
+    g_so_trace_state.last_rc = 0;
+    amem_so_trace_clear_locked();
+    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+
+    return 0;
+}
+
+static size_t amem_so_trace_dump(char *buf, size_t buf_size, int include_events)
+{
+    struct amem_so_trace_event snapshot[AMEM_SO_TRACE_EVENT_CAP];
+    unsigned long flags = 0;
+    u32 state = AMEM_SO_TRACE_STATE_IDLE;
+    u32 stop_reason = AMEM_SO_TRACE_STOP_NONE;
+    u32 step_limit = 0;
+    u32 len = 0;
+    u32 count = 0;
+    u32 head = 0;
+    u32 i = 0;
+    s32 last_rc = 0;
+    int armed = 0;
+    int running = 0;
+    pid_t pid = 0;
+    u64 entry_addr = 0;
+    u64 module_base = 0;
+    u64 module_end = 0;
+    u64 hit_count = 0;
+    u64 dropped = 0;
+    size_t used = 0;
+
+    if (!buf || buf_size == 0) {
+        return 0;
+    }
+
+    flags = spin_lock_irqsave(&g_so_trace_state.lock);
+    armed = g_so_trace_state.armed;
+    running = g_so_trace_state.running;
+    pid = g_so_trace_state.pid;
+    entry_addr = g_so_trace_state.entry_addr;
+    module_base = g_so_trace_state.module_base;
+    module_end = g_so_trace_state.module_end;
+    len = g_so_trace_state.len;
+    step_limit = g_so_trace_state.step_limit;
+    state = g_so_trace_state.state;
+    stop_reason = g_so_trace_state.stop_reason;
+    last_rc = g_so_trace_state.last_rc;
+    hit_count = g_so_trace_state.hit_count;
+    dropped = g_so_trace_state.dropped;
+    count = g_so_trace_state.count;
+    head = g_so_trace_state.head;
+    for (i = 0; i < count; ++i) {
+        amem_so_trace_copy_event(&snapshot[i],
+                                 &g_so_trace_state.events[(head + i) % AMEM_SO_TRACE_EVENT_CAP]);
+    }
+    spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+
+    used += scnprintf(buf + used, buf_size - used,
+                      "armed=%d\nrunning=%d\nstate=%u\nstate_text=%s\nstop_reason=%u\nstop_reason_text=%s\npid=%d\nentry_addr=%llx\nmodule_base=%llx\nmodule_end=%llx\nlen=%u\nstep_limit=%u\nhits=%llu\ndropped=%llu\ncount=%u\nlast_rc=%d\n",
+                      armed,
+                      running,
+                      state,
+                      amem_so_trace_state_name(state),
+                      stop_reason,
+                      amem_so_trace_stop_reason_name(stop_reason),
+                      pid,
+                      (unsigned long long)entry_addr,
+                      (unsigned long long)module_base,
+                      (unsigned long long)module_end,
+                      len,
+                      step_limit,
+                      (unsigned long long)hit_count,
+                      (unsigned long long)dropped,
+                      count,
+                      last_rc);
+
+    if (!include_events) {
+        if (used >= buf_size) {
+            used = buf_size - 1;
+        }
+        buf[used] = '\0';
+        return used;
+    }
+
+    for (i = 0; i < count && used < buf_size; ++i) {
+        const struct amem_so_trace_event *event = &snapshot[i];
+        used += scnprintf(buf + used, buf_size - used,
+                          "event[%u]=seq:%llu pid:%d tid:%d bp:%llx pc:%llx sp:%llx pstate:%llx x0:%llx x1:%llx x2:%llx x3:%llx x29:%llx x30:%llx\n",
+                          i,
+                          (unsigned long long)event->seq,
+                          event->pid,
+                          event->tid,
+                          (unsigned long long)event->bp_addr,
+                          (unsigned long long)event->pc,
+                          (unsigned long long)event->sp,
+                          (unsigned long long)event->pstate,
+                          (unsigned long long)event->regs[0],
+                          (unsigned long long)event->regs[1],
+                          (unsigned long long)event->regs[2],
+                          (unsigned long long)event->regs[3],
+                          (unsigned long long)event->regs[29],
+                          (unsigned long long)event->regs[30]);
+    }
+
+    if (used >= buf_size) {
+        used = buf_size - 1;
+    }
+    buf[used] = '\0';
+    return used;
+}
+
 static int copy_user_iovec(struct iovec **out_iov,
                            const struct iovec __user *user_iov,
                            unsigned long iovcnt)
@@ -1196,6 +1758,7 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
 
     pgtable_init();
     spin_lock_init(&g_record_state.lock);
+    spin_lock_init(&g_so_trace_state.lock);
     kfunc_match(sprintf, NULL, 0);
     kfunc_match(_raw_spin_lock_irqsave, NULL, 0);
     kfunc_match(_raw_spin_unlock_irqrestore, NULL, 0);
@@ -1218,6 +1781,26 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
         kallsyms_lookup_name("modify_user_hw_breakpoint");
     g_unregister_hw_breakpoint = (unregister_hw_breakpoint_fn)(uintptr_t)
         kallsyms_lookup_name("unregister_hw_breakpoint");
+    g_user_enable_single_step = (user_single_step_fn)(uintptr_t)
+        kallsyms_lookup_name("user_enable_single_step");
+    g_user_disable_single_step = (user_single_step_fn)(uintptr_t)
+        kallsyms_lookup_name("user_disable_single_step");
+    g_register_step_hook = (register_step_hook_fn)(uintptr_t)
+        kallsyms_lookup_name("register_user_step_hook");
+    if (!g_register_step_hook) {
+        g_register_step_hook = (register_step_hook_fn)(uintptr_t)
+            kallsyms_lookup_name("register_step_hook");
+    }
+    g_unregister_step_hook = (unregister_step_hook_fn)(uintptr_t)
+        kallsyms_lookup_name("unregister_user_step_hook");
+    if (!g_unregister_step_hook) {
+        g_unregister_step_hook = (unregister_step_hook_fn)(uintptr_t)
+            kallsyms_lookup_name("unregister_step_hook");
+    }
+    if (g_register_step_hook && g_unregister_step_hook) {
+        g_register_step_hook(&g_so_trace_step_hook);
+        g_step_hook_registered = 1;
+    }
 
     if (!kf__raw_spin_lock_irqsave || !kf__raw_spin_unlock_irqrestore ||
         !kf___rcu_read_lock || !kf___rcu_read_unlock ||
@@ -1266,8 +1849,21 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "read_count=%llu\n"
                 "write_count=%llu\n"
                 "debug_record_mode=prototype_exec_oneshot_linear_and_ret_manual_rearm_patch\n"
+                "debug_so_trace_mode=prototype_so_range_single_step_oneshot\n"
                 "debug_interactive_mode=planned\n"
                 "record_scope=single_task_vpid\n"
+                "so_trace_supported=%d\n"
+                "so_trace_armed=%d\n"
+                "so_trace_running=%d\n"
+                "so_trace_state=%u\n"
+                "so_trace_stop_reason=%u\n"
+                "so_trace_pid=%d\n"
+                "so_trace_entry_addr=%llx\n"
+                "so_trace_module_base=%llx\n"
+                "so_trace_module_end=%llx\n"
+                "so_trace_step_limit=%u\n"
+                "so_trace_hits=%llu\n"
+                "so_trace_count=%u\n"
                 "record_armed=%d\n"
                 "record_auto_disable_on_hit=%d\n"
                 "record_auto_rearm_on_hit=%d\n"
@@ -1293,6 +1889,20 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 write_hook_installed,
                 (unsigned long long)read_count,
                 (unsigned long long)write_count,
+                (g_register_user_hw_breakpoint && g_unregister_hw_breakpoint &&
+                 g_user_enable_single_step && g_user_disable_single_step &&
+                 g_step_hook_registered) ? 1 : 0,
+                g_so_trace_state.armed,
+                g_so_trace_state.running,
+                g_so_trace_state.state,
+                g_so_trace_state.stop_reason,
+                g_so_trace_state.pid,
+                (unsigned long long)g_so_trace_state.entry_addr,
+                (unsigned long long)g_so_trace_state.module_base,
+                (unsigned long long)g_so_trace_state.module_end,
+                g_so_trace_state.step_limit,
+                (unsigned long long)g_so_trace_state.hit_count,
+                g_so_trace_state.count,
                 g_record_state.armed,
                 g_record_state.auto_disable_on_hit,
                 g_record_state.auto_rearm_on_hit,
@@ -1328,11 +1938,23 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 "register_user_hw_breakpoint=%lx\n"
                 "modify_user_hw_breakpoint=%lx\n"
                 "unregister_hw_breakpoint=%lx\n"
+                "register_user_step_hook=%lx\n"
+                "unregister_user_step_hook=%lx\n"
+                "register_step_hook=%lx\n"
+                "unregister_step_hook=%lx\n"
+                "user_enable_single_step=%lx\n"
+                "user_disable_single_step=%lx\n"
                 "ptrace_hbptriggered=%lx\n"
                 "arch_ptrace=%lx\n",
                 kallsyms_lookup_name("register_user_hw_breakpoint"),
                 kallsyms_lookup_name("modify_user_hw_breakpoint"),
                 kallsyms_lookup_name("unregister_hw_breakpoint"),
+                kallsyms_lookup_name("register_user_step_hook"),
+                kallsyms_lookup_name("unregister_user_step_hook"),
+                kallsyms_lookup_name("register_step_hook"),
+                kallsyms_lookup_name("unregister_step_hook"),
+                kallsyms_lookup_name("user_enable_single_step"),
+                kallsyms_lookup_name("user_disable_single_step"),
                 kallsyms_lookup_name("ptrace_hbptriggered"),
                 kallsyms_lookup_name("arch_ptrace"));
         return write_text_response(out_msg, outlen, buf);
@@ -1359,6 +1981,16 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         used = append_line(buf, sizeof(buf), used, "mode.record_only.patch_clear_cmd=record-patch-clear");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.read_cmd=record-read");
         used = append_line(buf, sizeof(buf), used, "mode.record_only.best_for=manual low-pause return patching");
+        used = append_line(buf, sizeof(buf), used, "mode.so_trace=prototype_so_range_single_step_oneshot");
+        used = append_line(buf, sizeof(buf), used, "mode.so_trace.pause_target=0");
+        used = append_line(buf, sizeof(buf), used, "mode.so_trace.scope=single_task_vpid_and_so_range");
+        used = append_line(buf, sizeof(buf), used, "mode.so_trace.arm_cmd=trace-so-arm <tid_or_pid> <entry_addr> <module_base> <module_end> [step_limit] [len]");
+        used = append_line(buf, sizeof(buf), used, "mode.so_trace.disarm_cmd=trace-so-disarm");
+        used = append_line(buf, sizeof(buf), used, "mode.so_trace.clear_cmd=trace-so-clear");
+        used = append_line(buf, sizeof(buf), used, "mode.so_trace.status_cmd=trace-so-status");
+        used = append_line(buf, sizeof(buf), used, "mode.so_trace.read_cmd=trace-so-read");
+        used = append_line(buf, sizeof(buf), used, "mode.so_trace.stop=leave_module_or_step_limit");
+        used = append_line(buf, sizeof(buf), used, "mode.so_trace.best_for=bounded_so_flow_trace_without_ptrace");
         used = append_line(buf, sizeof(buf), used, "mode.interactive=planned");
         used = append_line(buf, sizeof(buf), used, "mode.interactive.pause_target=1");
         used = append_line(buf, sizeof(buf), used, "mode.interactive.view_registers=planned");
@@ -1376,6 +2008,12 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         used = append_symbol_line(buf, sizeof(buf), used, "register_user_hw_breakpoint");
         used = append_symbol_line(buf, sizeof(buf), used, "modify_user_hw_breakpoint");
         used = append_symbol_line(buf, sizeof(buf), used, "unregister_hw_breakpoint");
+        used = append_symbol_line(buf, sizeof(buf), used, "register_user_step_hook");
+        used = append_symbol_line(buf, sizeof(buf), used, "unregister_user_step_hook");
+        used = append_symbol_line(buf, sizeof(buf), used, "register_step_hook");
+        used = append_symbol_line(buf, sizeof(buf), used, "unregister_step_hook");
+        used = append_symbol_line(buf, sizeof(buf), used, "user_enable_single_step");
+        used = append_symbol_line(buf, sizeof(buf), used, "user_disable_single_step");
         used = append_symbol_line(buf, sizeof(buf), used, "ptrace_hbptriggered");
         used = append_symbol_line(buf, sizeof(buf), used, "arch_ptrace");
         used = append_symbol_line(buf, sizeof(buf), used, "_raw_spin_lock_irqsave");
@@ -1553,6 +2191,71 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         return write_text_response(out_msg, outlen, buf);
     }
 
+    if (!strncmp(args, "trace-so-arm", 12)) {
+        int pid = 0;
+        unsigned long long entry_addr = 0;
+        unsigned long long module_base = 0;
+        unsigned long long module_end = 0;
+        unsigned int step_limit = AMEM_SO_TRACE_DEFAULT_STEP_LIMIT;
+        unsigned int len = 4;
+        int matched = sscanf(args + 12, "%d %llx %llx %llx %u %u",
+                             &pid, &entry_addr, &module_base, &module_end,
+                             &step_limit, &len);
+        int rc = 0;
+
+        if (matched < 4) {
+            return write_text_response(out_msg, outlen,
+                                       "usage: trace-so-arm <tid_or_pid> <entry_addr_hex> <module_base_hex> <module_end_hex> [step_limit] [len]");
+        }
+
+        rc = amem_so_trace_arm((pid_t)pid, (u64)entry_addr,
+                               (u64)module_base, (u64)module_end,
+                               step_limit, len);
+        if (rc < 0) {
+            scnprintf(buf, sizeof(buf), "trace-so-arm failed rc=%d", rc);
+            return write_text_response(out_msg, outlen, buf);
+        }
+        scnprintf(buf, sizeof(buf),
+                  "trace-so-arm ok pid=%d entry=%llx module=[%llx,%llx) step_limit=%u len=%u",
+                  pid, entry_addr, module_base, module_end, step_limit, len);
+        return write_text_response(out_msg, outlen, buf);
+    }
+
+    if (!strcmp(args, "trace-so-disarm")) {
+        int rc = amem_so_trace_disarm();
+        if (rc < 0) {
+            scnprintf(buf, sizeof(buf), "trace-so-disarm failed rc=%d", rc);
+            return write_text_response(out_msg, outlen, buf);
+        }
+        return write_text_response(out_msg, outlen, "trace-so-disarm ok");
+    }
+
+    if (!strcmp(args, "trace-so-clear")) {
+        unsigned long flags = 0;
+
+        flags = spin_lock_irqsave(&g_so_trace_state.lock);
+        if (g_so_trace_state.armed || g_so_trace_state.running) {
+            spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+            return write_text_response(out_msg, outlen, "trace-so-clear failed rc=-16");
+        }
+        g_so_trace_state.state = AMEM_SO_TRACE_STATE_IDLE;
+        g_so_trace_state.stop_reason = AMEM_SO_TRACE_STOP_NONE;
+        g_so_trace_state.last_rc = 0;
+        amem_so_trace_clear_locked();
+        spin_unlock_irqrestore(&g_so_trace_state.lock, flags);
+        return write_text_response(out_msg, outlen, "trace-so-clear ok");
+    }
+
+    if (!strcmp(args, "trace-so-status")) {
+        amem_so_trace_dump(buf, sizeof(buf), 0);
+        return write_text_response(out_msg, outlen, buf);
+    }
+
+    if (!strcmp(args, "trace-so-read")) {
+        amem_so_trace_dump(buf, sizeof(buf), 1);
+        return write_text_response(out_msg, outlen, buf);
+    }
+
     if (!strncmp(args, "sym:", 4)) {
         sym = kallsyms_lookup_name(args + 4);
         sprintf(buf, "%lx", sym);
@@ -1560,7 +2263,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
     }
 
     return write_text_response(out_msg, outlen,
-                               "commands: status | reset | caps | debugcaps | modes | record-arm | record-arm-loop | record-arm-ret-loop | record-patch-set | record-patch-clear | record-disarm | record-clear | record-status | record-read | sym:<symbol>");
+                               "commands: status | reset | caps | debugcaps | modes | record-arm | record-arm-loop | record-arm-ret-loop | record-patch-set | record-patch-clear | record-disarm | record-clear | record-status | record-read | trace-so-arm | trace-so-disarm | trace-so-clear | trace-so-status | trace-so-read | sym:<symbol>");
 }
 
 static long amem_kpm_exit(void *__user reserved)
@@ -1581,6 +2284,15 @@ static long amem_kpm_exit(void *__user reserved)
     if (rc < 0) {
         pr_err("amem-kpm exit blocked: record state busy rc=%d\n", rc);
         return rc;
+    }
+    rc = amem_so_trace_disarm();
+    if (rc < 0) {
+        pr_err("amem-kpm exit blocked: so trace state busy rc=%d\n", rc);
+        return rc;
+    }
+    if (g_step_hook_registered && g_unregister_step_hook) {
+        g_unregister_step_hook(&g_so_trace_step_hook);
+        g_step_hook_registered = 0;
     }
     pr_info("amem-kpm exit\n");
     return 0;
