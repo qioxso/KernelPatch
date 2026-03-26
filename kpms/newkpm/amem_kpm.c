@@ -27,7 +27,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.9");
+KPM_VERSION("1.4.10");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -506,6 +506,19 @@ static int amem_so_trace_register_step_hook(void)
     }
     g_register_step_hook(&g_so_trace_step_hook);
     g_step_hook_registered = 1;
+    return 0;
+}
+
+static int amem_so_trace_unregister_step_hook(void)
+{
+    if (!g_step_hook_registered) {
+        return 0;
+    }
+    if (!g_unregister_step_hook) {
+        return -ENOSYS;
+    }
+    g_unregister_step_hook(&g_so_trace_step_hook);
+    g_step_hook_registered = 0;
     return 0;
 }
 
@@ -1277,6 +1290,7 @@ static int amem_so_trace_disarm(void)
     unsigned long flags = 0;
     pid_t pid = 0;
     int need_disable_step = 0;
+    int unregister_rc = 0;
 
     flags = spin_lock_irqsave(&g_so_trace_state.lock);
     event = g_so_trace_state.event;
@@ -1311,6 +1325,11 @@ static int amem_so_trace_disarm(void)
         rcu_read_unlock();
     }
 
+    unregister_rc = amem_so_trace_unregister_step_hook();
+    if (unregister_rc < 0) {
+        return unregister_rc;
+    }
+
     return 0;
 }
 
@@ -1327,6 +1346,9 @@ static int amem_so_trace_arm(pid_t pid, u64 entry_addr,
     if (!g_register_user_hw_breakpoint || !g_unregister_hw_breakpoint ||
         !g_user_enable_single_step || !g_user_disable_single_step) {
         return -ENOSYS;
+    }
+    if (kver < VERSION(5, 4, 0)) {
+        return -EOPNOTSUPP;
     }
     if (pid <= 0 || entry_addr == 0 || module_base == 0 ||
         module_end <= module_base) {
@@ -1789,10 +1811,6 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
         kallsyms_lookup_name("register_user_step_hook");
     g_unregister_step_hook = (unregister_step_hook_fn)(uintptr_t)
         kallsyms_lookup_name("unregister_user_step_hook");
-    if (g_register_step_hook && g_unregister_step_hook) {
-        g_register_step_hook(&g_so_trace_step_hook);
-        g_step_hook_registered = 1;
-    }
 
     if (!kf__raw_spin_lock_irqsave || !kf__raw_spin_unlock_irqrestore ||
         !kf___rcu_read_lock || !kf___rcu_read_unlock ||
@@ -1881,9 +1899,10 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                 write_hook_installed,
                 (unsigned long long)read_count,
                 (unsigned long long)write_count,
-                (g_register_user_hw_breakpoint && g_unregister_hw_breakpoint &&
+                (kver >= VERSION(5, 4, 0) &&
+                 g_register_user_hw_breakpoint && g_unregister_hw_breakpoint &&
                  g_user_enable_single_step && g_user_disable_single_step &&
-                 g_step_hook_registered) ? 1 : 0,
+                 g_register_step_hook && g_unregister_step_hook) ? 1 : 0,
                 g_so_trace_state.armed,
                 g_so_trace_state.running,
                 g_so_trace_state.state,
@@ -1982,6 +2001,7 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
         used = append_line(buf, sizeof(buf), used, "mode.so_trace.status_cmd=trace-so-status");
         used = append_line(buf, sizeof(buf), used, "mode.so_trace.read_cmd=trace-so-read");
         used = append_line(buf, sizeof(buf), used, "mode.so_trace.stop=leave_module_or_step_limit");
+        used = append_line(buf, sizeof(buf), used, "mode.so_trace.min_kernel=5.4.0");
         used = append_line(buf, sizeof(buf), used, "mode.so_trace.best_for=bounded_so_flow_trace_without_ptrace");
         used = append_line(buf, sizeof(buf), used, "mode.interactive=planned");
         used = append_line(buf, sizeof(buf), used, "mode.interactive.pause_target=1");
@@ -2204,7 +2224,13 @@ static long amem_kpm_control0(const char *args, char *__user out_msg, int outlen
                                (u64)module_base, (u64)module_end,
                                step_limit, len);
         if (rc < 0) {
-            scnprintf(buf, sizeof(buf), "trace-so-arm failed rc=%d", rc);
+            if (rc == -EOPNOTSUPP) {
+                scnprintf(buf, sizeof(buf),
+                          "trace-so-arm failed rc=%d unsupported_kernel_need_5_4_plus",
+                          rc);
+            } else {
+                scnprintf(buf, sizeof(buf), "trace-so-arm failed rc=%d", rc);
+            }
             return write_text_response(out_msg, outlen, buf);
         }
         scnprintf(buf, sizeof(buf),
