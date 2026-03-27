@@ -64,6 +64,9 @@ void kfunc_def(mmput)(struct mm_struct *mm);
 void *kfunc_def(vmalloc)(unsigned long size);
 void *kfunc_def(vmalloc_noprof)(unsigned long size);
 void kfunc_def(vfree)(const void *addr);
+void *kfunc_def(__kmalloc)(size_t size, gfp_t flags);
+void *kfunc_def(kmalloc)(size_t size, gfp_t flags);
+void kfunc_def(kfree)(const void *objp);
 unsigned long kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, unsigned long n);
 unsigned long kfunc_def(__arch_copy_from_user)(void *to, const void __user *from, unsigned long n);
 
