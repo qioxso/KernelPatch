@@ -28,7 +28,7 @@
 #include <ktypes.h>
 
 KPM_NAME("amem-kpm");
-KPM_VERSION("1.4.14");
+KPM_VERSION("1.4.15");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("OpenAI");
 KPM_DESCRIPTION("AMem process_vm hook bridge for Android process memory read/write");
@@ -64,9 +64,6 @@ void kfunc_def(mmput)(struct mm_struct *mm);
 void *kfunc_def(vmalloc)(unsigned long size);
 void *kfunc_def(vmalloc_noprof)(unsigned long size);
 void kfunc_def(vfree)(const void *addr);
-void *kfunc_def(__kmalloc)(size_t size, gfp_t flags);
-void *kfunc_def(kmalloc)(size_t size, gfp_t flags);
-void kfunc_def(kfree)(const void *objp);
 unsigned long kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, unsigned long n);
 unsigned long kfunc_def(__arch_copy_from_user)(void *to, const void __user *from, unsigned long n);
 
@@ -189,6 +186,8 @@ typedef int (*access_process_vm_fn)(
     void *buf,
     int len,
     unsigned int gup_flags);
+typedef void *(*amem_kmalloc_fn)(size_t size, gfp_t flags);
+typedef void (*amem_kfree_fn)(const void *objp);
 
 struct amem_record_event {
     u64 seq;
@@ -279,6 +278,8 @@ static user_single_step_fn g_user_disable_single_step = NULL;
 static register_step_hook_fn g_register_step_hook = NULL;
 static unregister_step_hook_fn g_unregister_step_hook = NULL;
 static access_process_vm_fn g_access_process_vm = NULL;
+static amem_kmalloc_fn g_amem_kmalloc = NULL;
+static amem_kfree_fn g_amem_kfree = NULL;
 static int g_step_hook_registered = 0;
 static struct amem_record_state g_record_state;
 static struct amem_so_trace_state g_so_trace_state;
@@ -1477,8 +1478,8 @@ static int copy_process_bytes_access_vm(struct task_struct *task,
         bounce_size = 4096;
     }
 
-    if ((kf_kmalloc || kf___kmalloc) && kf_kfree) {
-        bounce = kmalloc(bounce_size, AMEM_KMALLOC_GFP);
+    if (g_amem_kmalloc && g_amem_kfree) {
+        bounce = g_amem_kmalloc(bounce_size, AMEM_KMALLOC_GFP);
         if (bounce) {
             bounce_from_kmalloc = 1;
         }
@@ -1530,8 +1531,8 @@ static int copy_process_bytes_access_vm(struct task_struct *task,
         copied += chunk;
     }
 
-    if (bounce_from_kmalloc) {
-        kfree(bounce);
+    if (bounce_from_kmalloc && g_amem_kfree) {
+        g_amem_kfree(bounce);
     } else {
         kf_vfree(bounce);
     }
@@ -1787,11 +1788,17 @@ static long amem_kpm_init(const char *args, const char *event, void *__user rese
     kfunc_match(vmalloc, NULL, 0);
     kfunc_match(vmalloc_noprof, NULL, 0);
     kfunc_match(vfree, NULL, 0);
-    kfunc_match(__kmalloc, NULL, 0);
-    kfunc_match(kmalloc, NULL, 0);
-    kfunc_match(kfree, NULL, 0);
     kfunc_match(__arch_copy_to_user, NULL, 0);
     kfunc_match(__arch_copy_from_user, NULL, 0);
+
+    g_amem_kmalloc = (amem_kmalloc_fn)(uintptr_t)
+        kallsyms_lookup_name("__kmalloc");
+    if (!g_amem_kmalloc) {
+        g_amem_kmalloc = (amem_kmalloc_fn)(uintptr_t)
+            kallsyms_lookup_name("kmalloc");
+    }
+    g_amem_kfree = (amem_kfree_fn)(uintptr_t)
+        kallsyms_lookup_name("kfree");
 
     g_register_user_hw_breakpoint = (register_user_hw_breakpoint_fn)(uintptr_t)
         kallsyms_lookup_name("register_user_hw_breakpoint");
